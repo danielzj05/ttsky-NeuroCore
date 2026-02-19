@@ -1,8 +1,8 @@
 # Tiny Tapeout project information
 project:
   title:        "NeuroCore Field Sensor"      # Project title
-  author:       ""      # Your name
-  discord:      ""      # Your discord username, for communication and automatically assigning you a Tapeout role (optional)
+  author:       "Christoph Kassir, Daniel Zheng, Ben Liu, Michael Lander"      # Your name
+  discord:      "aatlemidrm, zhinkies, b1ueed, gaminghero279"      # Your discord username, for communication and automatically assigning you a Tapeout role (optional)
   description:  "Ultra-low-power digital magnetic field sensing system with event-driven LMS, DWT, CORDIC, and LSK modulation"
   language:     "Verilog" # other examples include SystemVerilog, Amaranth, VHDL, etc
   clock_hz:     50000000       # Clock frequency in Hz (50 MHz, matching config.json CLOCK_PERIOD=20ns)
@@ -19,7 +19,6 @@ project:
   source_files:
     - "project.v"
     - "neurocore_field_sensor.v"
-    - "neurocore_blocks.v"
 
 # The pinout of your project. Leave unused pins blank. DO NOT delete or add any pins.
 # This section is for the datasheet/website. Use descriptive names (e.g., RX, TX, MOSI, SCL, SEG_A, etc.).

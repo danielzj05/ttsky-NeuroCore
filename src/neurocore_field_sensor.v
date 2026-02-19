@@ -72,17 +72,20 @@ module neurocore_field_sensor #(
     wire                     lms_start;
     
     // DWT Engine signals
-    wire [DWT_WIDTH-1:0]     dwt_out [0:7];    // 8 sub-bands
+    wire [DWT_WIDTH-1:0]     dwt_out_0, dwt_out_1, dwt_out_2, dwt_out_3;
+    wire [DWT_WIDTH-1:0]     dwt_out_4, dwt_out_5, dwt_out_6, dwt_out_7;
     wire                     dwt_valid;
     wire                     dwt_start;
     
     // CORDIC signals
-    wire [CORDIC_WIDTH-1:0]  cordic_mag [0:7]; // 8 magnitudes
+    wire [CORDIC_WIDTH-1:0]  cordic_mag_0, cordic_mag_1, cordic_mag_2, cordic_mag_3;
+    wire [CORDIC_WIDTH-1:0]  cordic_mag_4, cordic_mag_5, cordic_mag_6, cordic_mag_7;
     wire                     cordic_valid;
     wire                     cordic_start;
     
     // Power Accumulator signals
-    wire [15:0]              power_bins [0:NUM_BINS-1];
+    wire [15:0]              power_bins_0, power_bins_1, power_bins_2, power_bins_3;
+    wire [15:0]              power_bins_4, power_bins_5, power_bins_6, power_bins_7;
     wire                     acc_valid;
     wire                     acc_start;
     
@@ -227,14 +230,14 @@ module neurocore_field_sensor #(
         .rst_n(rst_n),
         .data_in(lms_out),
         .start(dwt_start),
-        .subband_0(dwt_out[0]),
-        .subband_1(dwt_out[1]),
-        .subband_2(dwt_out[2]),
-        .subband_3(dwt_out[3]),
-        .subband_4(dwt_out[4]),
-        .subband_5(dwt_out[5]),
-        .subband_6(dwt_out[6]),
-        .subband_7(dwt_out[7]),
+        .subband_0(dwt_out_0),
+        .subband_1(dwt_out_1),
+        .subband_2(dwt_out_2),
+        .subband_3(dwt_out_3),
+        .subband_4(dwt_out_4),
+        .subband_5(dwt_out_5),
+        .subband_6(dwt_out_6),
+        .subband_7(dwt_out_7),
         .out_valid(dwt_valid),
         .busy(dwt_busy)
     );
@@ -249,22 +252,22 @@ module neurocore_field_sensor #(
         .clk(clk),
         .rst_n(rst_n),
         .start(cordic_start),
-        .x_in_0(dwt_out[0]),
-        .x_in_1(dwt_out[1]),
-        .x_in_2(dwt_out[2]),
-        .x_in_3(dwt_out[3]),
-        .x_in_4(dwt_out[4]),
-        .x_in_5(dwt_out[5]),
-        .x_in_6(dwt_out[6]),
-        .x_in_7(dwt_out[7]),
-        .mag_out_0(cordic_mag[0]),
-        .mag_out_1(cordic_mag[1]),
-        .mag_out_2(cordic_mag[2]),
-        .mag_out_3(cordic_mag[3]),
-        .mag_out_4(cordic_mag[4]),
-        .mag_out_5(cordic_mag[5]),
-        .mag_out_6(cordic_mag[6]),
-        .mag_out_7(cordic_mag[7]),
+        .x_in_0(dwt_out_0),
+        .x_in_1(dwt_out_1),
+        .x_in_2(dwt_out_2),
+        .x_in_3(dwt_out_3),
+        .x_in_4(dwt_out_4),
+        .x_in_5(dwt_out_5),
+        .x_in_6(dwt_out_6),
+        .x_in_7(dwt_out_7),
+        .mag_out_0(cordic_mag_0),
+        .mag_out_1(cordic_mag_1),
+        .mag_out_2(cordic_mag_2),
+        .mag_out_3(cordic_mag_3),
+        .mag_out_4(cordic_mag_4),
+        .mag_out_5(cordic_mag_5),
+        .mag_out_6(cordic_mag_6),
+        .mag_out_7(cordic_mag_7),
         .out_valid(cordic_valid),
         .busy(cordic_busy)
     );
@@ -279,22 +282,22 @@ module neurocore_field_sensor #(
         .clk(clk),
         .rst_n(rst_n),
         .start(acc_start),
-        .mag_in_0(cordic_mag[0]),
-        .mag_in_1(cordic_mag[1]),
-        .mag_in_2(cordic_mag[2]),
-        .mag_in_3(cordic_mag[3]),
-        .mag_in_4(cordic_mag[4]),
-        .mag_in_5(cordic_mag[5]),
-        .mag_in_6(cordic_mag[6]),
-        .mag_in_7(cordic_mag[7]),
-        .bin_0(power_bins[0]),
-        .bin_1(power_bins[1]),
-        .bin_2(power_bins[2]),
-        .bin_3(power_bins[3]),
-        .bin_4(power_bins[4]),
-        .bin_5(power_bins[5]),
-        .bin_6(power_bins[6]),
-        .bin_7(power_bins[7]),
+        .mag_in_0(cordic_mag_0),
+        .mag_in_1(cordic_mag_1),
+        .mag_in_2(cordic_mag_2),
+        .mag_in_3(cordic_mag_3),
+        .mag_in_4(cordic_mag_4),
+        .mag_in_5(cordic_mag_5),
+        .mag_in_6(cordic_mag_6),
+        .mag_in_7(cordic_mag_7),
+        .bin_0(power_bins_0),
+        .bin_1(power_bins_1),
+        .bin_2(power_bins_2),
+        .bin_3(power_bins_3),
+        .bin_4(power_bins_4),
+        .bin_5(power_bins_5),
+        .bin_6(power_bins_6),
+        .bin_7(power_bins_7),
         .out_valid(acc_valid)
     );
     
@@ -307,14 +310,14 @@ module neurocore_field_sensor #(
     ) u_cmd_encoder (
         .clk(clk),
         .rst_n(rst_n),
-        .bin_0(power_bins[0]),
-        .bin_1(power_bins[1]),
-        .bin_2(power_bins[2]),
-        .bin_3(power_bins[3]),
-        .bin_4(power_bins[4]),
-        .bin_5(power_bins[5]),
-        .bin_6(power_bins[6]),
-        .bin_7(power_bins[7]),
+        .bin_0(power_bins_0),
+        .bin_1(power_bins_1),
+        .bin_2(power_bins_2),
+        .bin_3(power_bins_3),
+        .bin_4(power_bins_4),
+        .bin_5(power_bins_5),
+        .bin_6(power_bins_6),
+        .bin_7(power_bins_7),
         .encode_en(state == S_ENCODE),
         .cmd_out(cmd_encoded),
         .cmd_ready(cmd_ready)
@@ -366,6 +369,7 @@ module lms_filter #(
     
     reg [2:0] tap_count;
     reg       processing;
+    integer   i;
     
     assign busy = processing;
     
@@ -381,7 +385,7 @@ module lms_filter #(
             if (data_valid) begin
                 // Shift in new data
                 delay_line[0] <= data_in;
-                for (integer i = 1; i < TAPS; i = i + 1)
+                for (i = 1; i < TAPS; i = i + 1)
                     delay_line[i] <= delay_line[i-1];
             end
             
