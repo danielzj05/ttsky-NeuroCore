@@ -1,51 +1,53 @@
 # Tiny Tapeout project information
 project:
-  title:        ""      # Project title
+  title:        "NeuroCore Field Sensor"      # Project title
   author:       ""      # Your name
   discord:      ""      # Your discord username, for communication and automatically assigning you a Tapeout role (optional)
-  description:  ""      # One line description of what your project does
+  description:  "Ultra-low-power digital magnetic field sensing system with event-driven LMS, DWT, CORDIC, and LSK modulation"
   language:     "Verilog" # other examples include SystemVerilog, Amaranth, VHDL, etc
-  clock_hz:     0       # Clock frequency in Hz (or 0 if not applicable)
+  clock_hz:     50000000       # Clock frequency in Hz (50 MHz, matching config.json CLOCK_PERIOD=20ns)
 
   # How many tiles your design occupies? A single tile is about 167x108 uM.
   tiles: "1x1"          # Valid values: 1x1, 1x2, 2x2, 3x2, 4x2, 6x2 or 8x2
 
   # Your top module name must start with "tt_um_". Make it unique by including your github username:
-  top_module:  "tt_um_example"
+  top_module:  "tt_um_NeuroCore"
 
   # List your project's source files here.
   # Source files must be in ./src and you must list each source file separately, one per line.
   # Don't forget to also update `PROJECT_SOURCES` in test/Makefile.
   source_files:
     - "project.v"
+    - "neurocore_field_sensor.v"
+    - "neurocore_blocks.v"
 
 # The pinout of your project. Leave unused pins blank. DO NOT delete or add any pins.
 # This section is for the datasheet/website. Use descriptive names (e.g., RX, TX, MOSI, SCL, SEG_A, etc.).
 pinout:
   # Inputs
-  ui[0]: ""
-  ui[1]: ""
-  ui[2]: ""
-  ui[3]: ""
-  ui[4]: ""
-  ui[5]: ""
+  ui[0]: "ADC_D0"
+  ui[1]: "ADC_D1"
+  ui[2]: "ADC_D2"
+  ui[3]: "ADC_D3"
+  ui[4]: "ADC_VALID"
+  ui[5]: "WAKE"
   ui[6]: ""
   ui[7]: ""
 
   # Outputs
-  uo[0]: ""
-  uo[1]: ""
-  uo[2]: ""
-  uo[3]: ""
-  uo[4]: ""
-  uo[5]: ""
-  uo[6]: ""
-  uo[7]: ""
+  uo[0]: "CMD_OUT0"
+  uo[1]: "CMD_OUT1"
+  uo[2]: "CMD_OUT2"
+  uo[3]: "CMD_VALID"
+  uo[4]: "LSK_CTRL"
+  uo[5]: "LSK_TX"
+  uo[6]: "PWR_GATE_CTRL"
+  uo[7]: "PROCESSING"
 
   # Bidirectional pins
-  uio[0]: ""
-  uio[1]: ""
-  uio[2]: ""
+  uio[0]: "LMS_BUSY"
+  uio[1]: "DWT_BUSY"
+  uio[2]: "CORDIC_BUSY"
   uio[3]: ""
   uio[4]: ""
   uio[5]: ""
