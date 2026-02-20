@@ -211,7 +211,7 @@ module neurocore_field_sensor #(
     ) u_lms_filter (
         .clk(clk),
         .rst_n(rst_n),
-        .data_in(adc_data),
+        .data_in({{(LMS_WIDTH-ADC_BITS){1'b0}}, adc_data}),
         .data_valid(adc_valid),
         .start(lms_start),
         .data_out(lms_out),
@@ -228,7 +228,7 @@ module neurocore_field_sensor #(
     ) u_dwt_engine (
         .clk(clk),
         .rst_n(rst_n),
-        .data_in(lms_out),
+        .data_in({{(DWT_WIDTH-LMS_WIDTH){1'b0}}, lms_out}),
         .start(dwt_start),
         .subband_0(dwt_out_0),
         .subband_1(dwt_out_1),
@@ -282,14 +282,14 @@ module neurocore_field_sensor #(
         .clk(clk),
         .rst_n(rst_n),
         .start(acc_start),
-        .mag_in_0(cordic_mag_0),
-        .mag_in_1(cordic_mag_1),
-        .mag_in_2(cordic_mag_2),
-        .mag_in_3(cordic_mag_3),
-        .mag_in_4(cordic_mag_4),
-        .mag_in_5(cordic_mag_5),
-        .mag_in_6(cordic_mag_6),
-        .mag_in_7(cordic_mag_7),
+        .mag_in_0({{4{1'b0}}, cordic_mag_0}),
+        .mag_in_1({{4{1'b0}}, cordic_mag_1}),
+        .mag_in_2({{4{1'b0}}, cordic_mag_2}),
+        .mag_in_3({{4{1'b0}}, cordic_mag_3}),
+        .mag_in_4({{4{1'b0}}, cordic_mag_4}),
+        .mag_in_5({{4{1'b0}}, cordic_mag_5}),
+        .mag_in_6({{4{1'b0}}, cordic_mag_6}),
+        .mag_in_7({{4{1'b0}}, cordic_mag_7}),
         .bin_0(power_bins_0),
         .bin_1(power_bins_1),
         .bin_2(power_bins_2),
@@ -408,7 +408,7 @@ module lms_filter #(
                     7: data_out <= data_out + (delay_line[7] >>> 1);  // 0.5
                 endcase
                 
-                if (tap_count == TAPS - 1) begin
+                if (tap_count == TAPS[2:0] - 3'd1) begin
                     processing <= 0;
                     out_valid <= 1;
                 end else begin
@@ -424,7 +424,7 @@ endmodule
 // Lifting-Scheme DWT Engine Module
 // ============================================================================
 module dwt_engine #(
-    parameter LEVELS = 3,
+    parameter LEVELS = 3,  /* verilator lint_off UNUSEDPARAM */
     parameter WIDTH  = 12
 ) (
     input  wire                 clk,
@@ -622,7 +622,7 @@ endmodule
 // Power Bin Accumulator Module
 // ============================================================================
 module power_accumulator #(
-    parameter NUM_BINS = 8,
+    parameter NUM_BINS = 8,  /* verilator lint_off UNUSEDPARAM */
     parameter WIDTH    = 16
 ) (
     input  wire                 clk,
@@ -688,7 +688,7 @@ endmodule
 // Command Encoder Module
 // ============================================================================
 module command_encoder #(
-    parameter NUM_BINS = 8,
+    parameter NUM_BINS  = 8,  /* verilator lint_off UNUSEDPARAM */
     parameter CMD_WIDTH = 3
 ) (
     input  wire                 clk,
@@ -706,32 +706,49 @@ module command_encoder #(
     output reg                  cmd_ready
 );
 
+    // Sequential scan to find max bin (no blocking assignments)
     reg [15:0] max_bin;
     reg [2:0]  max_idx;
-    
+    reg [3:0]  scan_idx;
+    reg        scanning;
+
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            cmd_out <= 0;
+            cmd_out   <= 0;
             cmd_ready <= 0;
+            max_bin   <= 0;
+            max_idx   <= 0;
+            scan_idx  <= 0;
+            scanning  <= 0;
         end else begin
             cmd_ready <= 0;
-            
-            if (encode_en) begin
-                // Find dominant bin (simplified)
-                max_bin = bin_0;
-                max_idx = 0;
-                
-                if (bin_1 > max_bin) begin max_bin = bin_1; max_idx = 1; end
-                if (bin_2 > max_bin) begin max_bin = bin_2; max_idx = 2; end
-                if (bin_3 > max_bin) begin max_bin = bin_3; max_idx = 3; end
-                if (bin_4 > max_bin) begin max_bin = bin_4; max_idx = 4; end
-                if (bin_5 > max_bin) begin max_bin = bin_5; max_idx = 5; end
-                if (bin_6 > max_bin) begin max_bin = bin_6; max_idx = 6; end
-                if (bin_7 > max_bin) begin max_bin = bin_7; max_idx = 7; end
-                
-                // Encode command based on dominant frequency bin
-                cmd_out <= max_idx[CMD_WIDTH-1:0];
-                cmd_ready <= 1;
+
+            if (encode_en && !scanning) begin
+                // Start scan: initialise with bin_0
+                max_bin  <= bin_0;
+                max_idx  <= 3'd0;
+                scan_idx <= 4'd1;
+                scanning <= 1;
+            end else if (scanning) begin
+                case (scan_idx)
+                    4'd1: begin if (bin_1 > max_bin) begin max_bin <= bin_1; max_idx <= 3'd1; end end
+                    4'd2: begin if (bin_2 > max_bin) begin max_bin <= bin_2; max_idx <= 3'd2; end end
+                    4'd3: begin if (bin_3 > max_bin) begin max_bin <= bin_3; max_idx <= 3'd3; end end
+                    4'd4: begin if (bin_4 > max_bin) begin max_bin <= bin_4; max_idx <= 3'd4; end end
+                    4'd5: begin if (bin_5 > max_bin) begin max_bin <= bin_5; max_idx <= 3'd5; end end
+                    4'd6: begin if (bin_6 > max_bin) begin max_bin <= bin_6; max_idx <= 3'd6; end end
+                    4'd7: begin if (bin_7 > max_bin) begin max_bin <= bin_7; max_idx <= 3'd7; end end
+                    default: begin end
+                endcase
+
+                if (scan_idx == 4'd7) begin
+                    // Done scanning — output result
+                    cmd_out   <= max_idx[CMD_WIDTH-1:0];
+                    cmd_ready <= 1;
+                    scanning  <= 0;
+                end else begin
+                    scan_idx <= scan_idx + 4'd1;
+                end
             end
         end
     end
