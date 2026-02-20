@@ -1,7 +1,7 @@
 # Tiny Tapeout project information
 project:
   title:        "NeuroCore Field Sensor"      # Project title
-  author:       "Christoph Kassir, Daniel Zheng, Ben Liu, Michael Lander"      # Your name
+  author:       "Christoph Kassir, Daniel Zheng, Ben Liu, Michael Lander"      # Project authors
   discord:      "aatlemidrm, zhinkies, b1ueed, gaminghero279"      # Your discord username, for communication and automatically assigning you a Tapeout role (optional)
   description:  "Ultra-low-power digital magnetic field sensing system with event-driven LMS, DWT, CORDIC, and LSK modulation"
   language:     "Verilog" # other examples include SystemVerilog, Amaranth, VHDL, etc
