@@ -706,7 +706,6 @@ module command_encoder #(
     output reg                  cmd_ready
 );
 
-    // Sequential scan to find max bin (no blocking assignments)
     reg [15:0] max_bin;
     reg [2:0]  max_idx;
     reg [3:0]  scan_idx;
@@ -724,29 +723,57 @@ module command_encoder #(
             cmd_ready <= 0;
 
             if (encode_en && !scanning) begin
-                // Start scan: initialise with bin_0
                 max_bin  <= bin_0;
                 max_idx  <= 3'd0;
                 scan_idx <= 4'd1;
                 scanning <= 1;
             end else if (scanning) begin
                 case (scan_idx)
-                    4'd1: begin if (bin_1 > max_bin) begin max_bin <= bin_1; max_idx <= 3'd1; end end
-                    4'd2: begin if (bin_2 > max_bin) begin max_bin <= bin_2; max_idx <= 3'd2; end end
-                    4'd3: begin if (bin_3 > max_bin) begin max_bin <= bin_3; max_idx <= 3'd3; end end
-                    4'd4: begin if (bin_4 > max_bin) begin max_bin <= bin_4; max_idx <= 3'd4; end end
-                    4'd5: begin if (bin_5 > max_bin) begin max_bin <= bin_5; max_idx <= 3'd5; end end
-                    4'd6: begin if (bin_6 > max_bin) begin max_bin <= bin_6; max_idx <= 3'd6; end end
-                    4'd7: begin if (bin_7 > max_bin) begin max_bin <= bin_7; max_idx <= 3'd7; end end
+                    4'd1: begin 
+                        if (bin_1 > max_bin) begin 
+                            max_bin <= bin_1; max_idx <= 3'd1; 
+                        end 
+                    end
+                    4'd2: begin 
+                        if (bin_2 > max_bin) begin 
+                            max_bin <= bin_2; max_idx <= 3'd2; 
+                        end 
+                    end
+                    4'd3: begin 
+                        if (bin_3 > max_bin) begin 
+                            max_bin <= bin_3; max_idx <= 3'd3; 
+                        end 
+                    end
+                    4'd4: begin 
+                        if (bin_4 > max_bin) begin 
+                            max_bin <= bin_4; max_idx <= 3'd4; 
+                        end 
+                    end
+                    4'd5: begin 
+                        if (bin_5 > max_bin) begin 
+                            max_bin <= bin_5; max_idx <= 3'd5; 
+                        end 
+                    end
+                    4'd6: begin 
+                        if (bin_6 > max_bin) begin 
+                            max_bin <= bin_6; max_idx <= 3'd6; 
+                        end 
+                    end
+                    4'd7: begin 
+                        if (bin_7 > max_bin) begin 
+                            max_bin <= bin_7; max_idx <= 3'd7; 
+                        end 
+                    end
+                    // NEW: extra cycle to latch the final result
+                    4'd8: begin
+                        cmd_out   <= max_idx;
+                        cmd_ready <= 1;
+                        scanning  <= 0;
+                    end
                     default: begin end
                 endcase
 
-                if (scan_idx == 4'd7) begin
-                    // Done scanning — output result
-                    cmd_out   <= max_idx[CMD_WIDTH-1:0];
-                    cmd_ready <= 1;
-                    scanning  <= 0;
-                end else begin
+                if (scan_idx <= 4'd8) begin
                     scan_idx <= scan_idx + 4'd1;
                 end
             end
@@ -759,8 +786,8 @@ endmodule
 // LSK Modulator Module
 // ============================================================================
 module lsk_modulator #(
-    parameter CMD_WIDTH = 3,
-    parameter BIT_PERIOD = 1000  // Clock cycles per bit (adjustable for data rate)
+    parameter CMD_WIDTH  = 3,
+    parameter BIT_PERIOD = 1000
 ) (
     input  wire                 clk,
     input  wire                 rst_n,
@@ -770,48 +797,86 @@ module lsk_modulator #(
     output reg                  tx_active
 );
 
-    reg [CMD_WIDTH-1:0] tx_shift_reg;
-    reg [2:0]           bit_count;
-    reg [10:0]          bit_timer;
-    reg                 transmitting;
-    
+    // ================================================================
+    // Packet format (MSB transmitted first):
+    //   [1010]    4-bit preamble   — receiver clock sync
+    //   [1100]    4-bit sync word  — marks start of data
+    //   [c2 c1 c0] 3-bit command  — payload
+    //   [p]       1-bit parity    — XOR of command bits
+    //   [11]      2-bit postamble — clean end marker
+    //   Total: 14 bits
+    // ================================================================
+
+    localparam PACKET_LEN   = 14;
+    localparam HALF_PERIOD  = BIT_PERIOD / 2;
+
+    // Packet shift register and control
+    reg [PACKET_LEN-1:0] packet_reg;
+    reg [3:0]            bit_count;     // counts down from PACKET_LEN-1
+    reg [10:0]           bit_timer;
+    reg                  transmitting;
+
+    // Parity computation
+    wire parity = cmd_in[2] ^ cmd_in[1] ^ cmd_in[0];
+
+    // Full packet assembly
+    wire [PACKET_LEN-1:0] full_packet = {
+        4'b1010,     // preamble
+        4'b1100,     // sync word
+        cmd_in,      // 3-bit command (MSB first)
+        parity,      // parity bit
+        2'b11        // postamble
+    };
+
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            lsk_ctrl <= 0;
-            tx_active <= 0;
-            transmitting <= 0;
-            bit_count <= 0;
-            bit_timer <= 0;
+            lsk_ctrl     <= 1'b0;
+            tx_active    <= 1'b0;
+            transmitting <= 1'b0;
+            packet_reg   <= {PACKET_LEN{1'b0}};
+            bit_count    <= 4'd0;
+            bit_timer    <= 11'd0;
         end else begin
+
             if (tx_start && !transmitting) begin
-                transmitting <= 1;
-                tx_active <= 1;
-                tx_shift_reg <= cmd_in;
-                bit_count <= CMD_WIDTH;
-                bit_timer <= 0;
+                // Load packet and begin transmission
+                transmitting <= 1'b1;
+                tx_active    <= 1'b1;
+                packet_reg   <= full_packet;
+                bit_count    <= PACKET_LEN[3:0] - 4'd1;  // start at MSB
+                bit_timer    <= 11'd0;
+
+                // Drive first half of first bit immediately
+                lsk_ctrl <= full_packet[PACKET_LEN-1];
             end
-            
+
             if (transmitting) begin
-                if (bit_timer < BIT_PERIOD - 1) begin
-                    bit_timer <= bit_timer + 1;
-                    // Manchester encoding: half period per phase
-                    if (bit_timer < BIT_PERIOD / 2)
-                        lsk_ctrl <= tx_shift_reg[0];
-                    else
-                        lsk_ctrl <= ~tx_shift_reg[0];
+                bit_timer <= bit_timer + 11'd1;
+
+                // Manchester encoding:
+                //   First half of bit period:  output = data bit
+                //   Second half of bit period: output = ~data bit
+                if (bit_timer < HALF_PERIOD[10:0]) begin
+                    lsk_ctrl <= packet_reg[bit_count];
                 end else begin
-                    bit_timer <= 0;
-                    tx_shift_reg <= {1'b0, tx_shift_reg[CMD_WIDTH-1:1]};
-                    
-                    if (bit_count == 1) begin
-                        transmitting <= 0;
-                        tx_active <= 0;
-                        lsk_ctrl <= 0;
+                    lsk_ctrl <= ~packet_reg[bit_count];
+                end
+
+                // End of bit period
+                if (bit_timer == BIT_PERIOD[10:0] - 11'd1) begin
+                    bit_timer <= 11'd0;
+
+                    if (bit_count == 4'd0) begin
+                        // All bits transmitted
+                        transmitting <= 1'b0;
+                        tx_active    <= 1'b0;
+                        lsk_ctrl     <= 1'b0;
                     end else begin
-                        bit_count <= bit_count - 1;
+                        bit_count <= bit_count - 4'd1;
                     end
                 end
             end
+
         end
     end
 
