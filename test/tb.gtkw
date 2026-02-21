@@ -1,39 +1,141 @@
 [*]
-[*] GTKWave Analyzer v3.4.0 (w)1999-2022 BSI
-[*] Mon Nov 20 16:00:28 2023
+[*] GTKWave Analyzer - NeuroCore Field Sensor
 [*]
-[dumpfile] "/home/uri/p/tt-new-template-proto/test/tb.fst"
-[dumpfile_mtime] "Mon Nov 20 15:58:34 2023"
-[dumpfile_size] 1110
-[savefile] "/home/uri/p/tt-new-template-proto/test/tb.gtkw"
+[dumpfile] "tb.fst"
 [timestart] 0
-[size] 1376 600
+[size] 1376 768
 [pos] -1 -1
 *-24.534533 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1 -1
 [treeopen] tb.
+[treeopen] tb.user_project.
+[treeopen] tb.user_project.sensor.
 [sst_width] 297
-[signals_width] 230
+[signals_width] 260
 [sst_expanded] 1
 [sst_vpaned_height] 158
 @28
-tb.user_project.ena
-@29
 tb.user_project.clk
 @28
 tb.user_project.rst_n
+@28
+tb.user_project.ena
 @200
--Inputs
+-ADC Interface
 @22
-tb.user_project.ui_in[7:0]
+tb.user_project.ui_in[3:0]
+@28
+tb.user_project.ui_in[4]
+@28
+tb.user_project.ui_in[5]
 @200
--Bidirectional Pins
+-FSM State
 @22
-tb.user_project.uio_in[7:0]
-tb.user_project.uio_oe[7:0]
-tb.user_project.uio_out[7:0]
+tb.user_project.sensor.state[3:0]
+@22
+tb.user_project.sensor.next_state[3:0]
+@22
+tb.user_project.sensor.watchdog[15:0]
+@200
+-Synchronizers
+@28
+tb.user_project.sensor.wake_sync
+@28
+tb.user_project.sensor.adc_valid_sync
+@28
+tb.user_project.sensor.sample_pending
+@200
+-FIR Filter
+@28
+tb.user_project.sensor.lms_start_reg
+@28
+tb.user_project.sensor.lms_busy
+@28
+tb.user_project.sensor.lms_valid
+@22
+tb.user_project.sensor.lms_out[7:0]
+@22
+tb.user_project.sensor.u_lms_filter.tap_count[2:0]
+@28
+tb.user_project.sensor.u_lms_filter.processing
+@200
+-DWT Engine
+@28
+tb.user_project.sensor.dwt_busy
+@28
+tb.user_project.sensor.dwt_valid
+@22
+tb.user_project.sensor.u_dwt_engine.sample_cnt[2:0]
+@22
+tb.user_project.sensor.u_dwt_engine.proc_level[2:0]
+@28
+tb.user_project.sensor.u_dwt_engine.collecting
+@28
+tb.user_project.sensor.u_dwt_engine.proc_active
+@200
+-Magnitude
+@28
+tb.user_project.sensor.mag_valid
+@22
+tb.user_project.sensor.mag_0[11:0]
+@22
+tb.user_project.sensor.mag_1[11:0]
+@200
+-Power Accumulator
+@28
+tb.user_project.sensor.acc_busy_int
+@28
+tb.user_project.sensor.acc_valid
+@22
+tb.user_project.sensor.u_power_acc.bin_idx[2:0]
+@28
+tb.user_project.sensor.u_power_acc.processing
+@200
+-Command Encoder
+@28
+tb.user_project.sensor.cmd_ready
+@22
+tb.user_project.sensor.cmd_encoded[2:0]
+@28
+tb.user_project.sensor.u_cmd_encoder.scanning
+@22
+tb.user_project.sensor.u_cmd_encoder.scan_idx[3:0]
+@22
+tb.user_project.sensor.u_cmd_encoder.max_idx[2:0]
+@22
+tb.user_project.sensor.u_cmd_encoder.max_bin[15:0]
+@200
+-LSK Modulator
+@28
+tb.user_project.sensor.lsk_start_pulse
+@28
+tb.user_project.sensor.lsk_tx
+@28
+tb.user_project.sensor.lsk_ctrl
+@22
+tb.user_project.sensor.u_lsk_mod.bit_count[3:0]
+@22
+tb.user_project.sensor.u_lsk_mod.bit_timer[9:0]
+@28
+tb.user_project.sensor.u_lsk_mod.transmitting
 @200
 -Output Pins
 @22
 tb.user_project.uo_out[7:0]
+@22
+tb.user_project.uio_out[7:0]
+@200
+-Output Decoded
+@28
+tb.user_project.uo_out[7]
+@28
+tb.user_project.uo_out[6]
+@28
+tb.user_project.uo_out[5]
+@28
+tb.user_project.uo_out[4]
+@28
+tb.user_project.uo_out[3]
+@22
+tb.user_project.uo_out[2:0]
 [pattern_trace] 1
 [pattern_trace] 0
