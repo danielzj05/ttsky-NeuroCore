@@ -12,6 +12,7 @@
 //   5. cordic_busy hard-wired to 0 (CORDIC removed)
 //   6. DWT wr_ptr defensive reset removed so circular buffer can fill across wake events
 //   7. Added $signed() casting to LMS and DWT for proper negative number arithmetic
+//   8. Replaced simulation initials with True Hardware Resets on arrays for GLS
 //
 // Copyright (c) 2024 Design Team
 // SPDX-License-Identifier: Apache-2.0
@@ -350,6 +351,8 @@ module lms_filter #(
             processing <= 0;
             out_valid  <= 0;
             data_out   <= 0;
+            // TRUE HARDWARE RESET for Gate-Level Sim robustness
+            for (i = 0; i < TAPS; i = i + 1) delay_line[i] <= 0;
         end else begin
             out_valid <= 0;
 
@@ -423,6 +426,7 @@ module dwt_haar_lift #(
     reg [WIDTH-1:0] d2_0, d2_1;
     reg [2:0] step;
     reg       proc;
+    integer   i;
 
     localparam ST_IDLE = 3'd0,
                ST_L1   = 3'd1,
@@ -444,6 +448,8 @@ module dwt_haar_lift #(
             d0 <= 0; d1 <= 0; d2 <= 0; d3 <= 0;
             a2_0 <= 0; a2_1 <= 0;
             d2_0 <= 0; d2_1 <= 0;
+            // TRUE HARDWARE RESET for Gate-Level Sim robustness
+            for (i = 0; i < 8; i = i + 1) buf_r[i] <= 0;
         end else begin
             out_valid <= 0;
 
