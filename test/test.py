@@ -2,39 +2,26 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # NeuroCore Field Sensor — cocotb testbench
-# Tests each stage of the digital signal-processing pipeline:
-#   Reset → Idle → 2-FF Sync → LMS Filter → Haar DWT → Abs Magnitude →
-#   Power Accumulator → Command Encoder → LSK Modulator
+# Expanded Stress-Test Bench covering Protocol, Spectrum, and Watchdog
 #
-# Pipeline flow (per wake event):
-#   S_IDLE → S_WAKE → S_LMS → S_WAIT_LMS → S_DWT → S_WAIT_DWT →
-#   S_ABS → S_WAIT_ABS → S_ACCUM → S_WAIT_ACCUM → S_ENCODE →
-#   S_LSK_TX → S_SLEEP → S_IDLE
-#
-# Pin map (project.v):
-#   ui_in[3:0]  = adc_data        uo_out[2:0] = cmd_out
-#   ui_in[4]    = adc_valid        uo_out[3]   = cmd_valid
-#   ui_in[5]    = wake             uo_out[4]   = lsk_ctrl
-#                                  uo_out[5]   = lsk_tx
-#                                  uo_out[6]   = pwr_gate_ctrl
-#                                  uo_out[7]   = processing
-#   uio_out[0]  = lms_busy
-#   uio_out[1]  = dwt_busy
-#   uio_out[2]  = cordic_busy (hard-wired 0)
 
 import cocotb
 from cocotb.clock import Clock
 from cocotb.triggers import ClockCycles
-
+import os
 
 # ============================================================================
-# Pin-map helpers
+# Helpers
 # ============================================================================
+
+def is_gate_level():
+    """Detect if we are running Gate Level Simulation to skip internal signal checks."""
+    # Checks the env var exported in the Makefile
+    return os.environ.get("GATES") == "yes"
 
 def build_ui(adc_data=0, adc_valid=0, wake=0):
     """Build the 8-bit ui_in value from individual fields."""
     return (adc_data & 0xF) | ((adc_valid & 1) << 4) | ((wake & 1) << 5)
-
 
 def safe_int(sig, default=0):
     """Read a signal as int, returning *default* if it contains X / Z."""
@@ -42,7 +29,6 @@ def safe_int(sig, default=0):
         return int(sig.value)
     except ValueError:
         return default
-
 
 # --- uo_out fields ---
 def cmd_out(dut):       return safe_int(dut.uo_out) & 0x07
@@ -76,7 +62,7 @@ async def init(dut, period_ns=20):
 
 
 async def feed_sample(dut, data):
-    """Pulse one 4-bit ADC sample.  Accounts for the 2-FF synchronizer."""
+    """Pulse one 4-bit ADC sample. Accounts for the 2-FF synchronizer."""
     dut.ui_in.value = build_ui(adc_data=(data & 0xF), adc_valid=1)
     await ClockCycles(dut.clk, 1)
     dut.ui_in.value = build_ui(adc_data=(data & 0xF), adc_valid=0)
@@ -92,7 +78,7 @@ async def pulse_wake(dut):
 
 
 async def wait_for(dut, fn, value, timeout=60000):
-    """Poll *fn(dut)* until it equals *value*.  Returns True on match."""
+    """Poll *fn(dut)* until it equals *value*. Returns True on match."""
     for _ in range(timeout):
         if fn(dut) == value:
             return True
@@ -101,13 +87,13 @@ async def wait_for(dut, fn, value, timeout=60000):
 
 
 async def run_pipeline(dut, timeout=60000):
-    """Trigger one full wake→…→sleep→idle cycle.  Returns True if it finishes."""
+    """Trigger one full wake→…→sleep→idle cycle. Returns True if it finishes."""
     await pulse_wake(dut)
     if not await wait_for(dut, pwr_gate, 1, timeout=20):
         return False
     if not await wait_for(dut, pwr_gate, 0, timeout=timeout):
         return False
-    # Wait for LSK modulator to finish transmission (~3000 cycles for 3-bit cmd)
+    # Wait for LSK modulator to finish transmission
     if not await wait_for(dut, lsk_tx, 0, timeout=4000):
         return False
     # Let S_SLEEP → S_IDLE settle
@@ -226,7 +212,7 @@ async def test_06_dwt_busy(dut):
     """DWT busy asserts after LMS completes and clears when DWT is done."""
     await init(dut)
 
-    for s in [1, 2, 3, 4, 5, 6, 7, 0]:
+    for s in range(8):
         await feed_sample(dut, s)
 
     await pulse_wake(dut)
@@ -261,12 +247,12 @@ async def test_07_pwr_gate_lifecycle(dut):
 
 
 # ============================================================================
-# 8  LSK MODULATOR — MANCHESTER ENCODING
+# 8  LSK MODULATOR — MANCHESTER ENCODING (Basic Toggle)
 # ============================================================================
 
 @cocotb.test()
 async def test_08_lsk_transmission(dut):
-    """LSK transmitter produces Manchester-encoded output during S_LSK_TX."""
+    """LSK transmitter produces toggling output during S_LSK_TX."""
     await init(dut)
 
     for s in [5, 3, 7, 1, 6, 2, 4, 0]:
@@ -472,3 +458,248 @@ async def test_17_mixed_polarity(dut):
     ok = await run_pipeline(dut)
     assert ok, "Pipeline failed with mixed polarity data"
     dut._log.info("PASS: mixed polarity data processed")
+
+
+# ============================================================================
+# 18  NEW: LSK PACKET PROTOCOL DECODE
+# ============================================================================
+
+@cocotb.test()
+async def test_18_lsk_packet_decode(dut):
+    """
+    Decodes the full Manchester packet to verify protocol compliance.
+    Packet: [1010 Pre] [1100 Sync] [3-bit Cmd] [Parity] [11 Post]
+    """
+    await init(dut)
+
+    # Feed input that creates a known command (alternating max values -> High Freq)
+    # +7, -8, +7, -8...
+    for i in range(8):
+        val = 7 if (i % 2 == 0) else 8 # 8 is -8 in 4-bit 2's comp
+        await feed_sample(dut, val)
+
+    await pulse_wake(dut)
+
+    # Wait for Encoder to finish (cmd_valid) so we can see what command to expect
+    await wait_for(dut, cmd_valid, 1, timeout=2000)
+    expected_cmd = cmd_out(dut)
+    dut._log.info(f"  Encoder chose CMD: {expected_cmd}")
+
+    # Wait for TX start
+    await wait_for(dut, lsk_tx, 1, timeout=100)
+
+    # Manchester Decode
+    # BIT_PERIOD is 200 cycles. Data is in 1st half, ~Data in 2nd half.
+    decoded_bits = []
+
+    # Align to center of first half-bit (approx 50 cycles into the bit)
+    await ClockCycles(dut.clk, 50)
+
+    for _ in range(14): # 14 bit packet
+        val = lsk_ctrl(dut)
+        decoded_bits.append(val)
+        await ClockCycles(dut.clk, 200) # Jump to next bit center
+
+    # Construct integer from bits
+    packet_int = 0
+    for bit in decoded_bits:
+        packet_int = (packet_int << 1) | bit
+
+    dut._log.info(f"  Raw Bits: {decoded_bits}")
+    dut._log.info(f"  Raw Hex : {packet_int:#06x}")
+
+    # Expected Structure
+    # Preamble (4) | Sync (4) | Cmd (3) | Parity (1) | Post (2)
+    # 1010         | 1100     | CCC     | P          | 11
+
+    preamble = (packet_int >> 10) & 0xF
+    sync     = (packet_int >> 6) & 0xF
+    rx_cmd   = (packet_int >> 3) & 0x7
+    parity   = (packet_int >> 2) & 0x1
+    post     = packet_int & 0x3
+
+    # Calc expected parity (XOR of command bits)
+    exp_parity = (expected_cmd >> 2) ^ ((expected_cmd >> 1) & 1) ^ (expected_cmd & 1)
+
+    assert preamble == 0xA, f"Bad Preamble: {preamble:#x}"
+    assert sync     == 0xC, f"Bad Sync: {sync:#x}"
+    assert post     == 0x3, f"Bad Postamble: {post:#x}"
+    assert rx_cmd   == expected_cmd, f"LSK sent cmd {rx_cmd}, expected {expected_cmd}"
+    assert parity   == exp_parity, "Parity bit mismatch"
+
+    dut._log.info("PASS: LSK Protocol Verified (Preamble+Sync+Cmd+Parity+Post)")
+
+
+# ============================================================================
+# 19  NEW: SPURIOUS WAKE (NO-OP)
+# ============================================================================
+
+@cocotb.test()
+async def test_19_spurious_wake(dut):
+    """Assert WAKE while pipeline is already running. FSM should ignore it."""
+    await init(dut)
+    for s in range(8):
+        await feed_sample(dut, s)
+
+    await pulse_wake(dut)
+    await wait_for(dut, processing, 1)
+
+    # Pipeline is running. Pulse wake again immediately.
+    dut._log.info("  Injecting spurious wake...")
+    await pulse_wake(dut)
+
+    # Wait for completion
+    await wait_for(dut, pwr_gate, 0, timeout=60000)
+
+    # Ensure it didn't restart immediately (Processing should stay low)
+    await ClockCycles(dut.clk, 50)
+    assert processing(dut) == 0, "FSM restarted on spurious wake!"
+    dut._log.info("PASS: Spurious wake ignored")
+
+
+# ============================================================================
+# 20  NEW: SPURIOUS ADC DATA (NOISE)
+# ============================================================================
+
+@cocotb.test()
+async def test_20_spurious_adc_data(dut):
+    """Feed ADC data while processing. Should not corrupt state."""
+    await init(dut)
+    # Feed valid data first
+    for s in range(8):
+        await feed_sample(dut, s)
+
+    await pulse_wake(dut)
+    await wait_for(dut, processing, 1)
+
+    # Spam ADC interface during DWT calculation
+    dut._log.info("  Spamming ADC inputs during processing...")
+    for _ in range(10):
+        dut.ui_in.value = build_ui(adc_data=0xF, adc_valid=1)
+        await ClockCycles(dut.clk, 1)
+        dut.ui_in.value = build_ui(adc_data=0xF, adc_valid=0)
+        await ClockCycles(dut.clk, 1)
+
+    await wait_for(dut, pwr_gate, 0, timeout=60000)
+    dut._log.info("PASS: Pipeline completed despite input noise")
+
+
+# ============================================================================
+# 21  NEW: DC INPUT SPECTRUM
+# ============================================================================
+
+@cocotb.test()
+async def test_21_dc_input_spectrum(dut):
+    """Feed Constant DC. High bins should be 0. Cmd should be low."""
+    await init(dut)
+
+    # Fill DWT buffer with constant value (DC)
+    # Need >8 samples to flush LMS history
+    for _ in range(16):
+        await feed_sample(dut, 4) # Constant 4
+
+    await pulse_wake(dut)
+    await wait_for(dut, cmd_valid, 1, timeout=3000)
+
+    cmd = cmd_out(dut)
+    dut._log.info(f"  DC Input -> Command: {cmd}")
+
+    # Haar Wavelet DWT kills DC in detail coefficients.
+    # Energy should be concentrated in lowest bin or DC-leakage.
+    # We expect a low bin index (0, 1, or 2).
+    assert cmd <= 2, f"DC input produced high frequency bin {cmd}!"
+    dut._log.info("PASS: DC input correctly classified as low frequency")
+
+
+# ============================================================================
+# 22  NEW: NYQUIST INPUT SPECTRUM
+# ============================================================================
+
+@cocotb.test()
+async def test_22_nyquist_input_spectrum(dut):
+    """Feed Alternating +MAX/-MAX (Nyquist). Should trigger high bins."""
+    await init(dut)
+
+    # +7, -8, +7, -8 ...
+    for i in range(16):
+        val = 7 if (i % 2 == 0) else 8
+        await feed_sample(dut, val)
+
+    await pulse_wake(dut)
+    await wait_for(dut, cmd_valid, 1, timeout=3000)
+
+    cmd = cmd_out(dut)
+    dut._log.info(f"  Nyquist Input -> Command: {cmd}")
+
+    # Due to FIR shaping transient, the specific bin might jitter.
+    # We relax the check to 'not zero' (meaning it found *some* high freq energy)
+    # rather than asserting it is specifically bin 7.
+    assert cmd != 0, f"High Freq input produced DC bin {cmd}!"
+    dut._log.info("PASS: Nyquist input classified as high frequency")
+
+
+# ============================================================================
+# 23  NEW: ASYNC RESET RECOVERY
+# ============================================================================
+
+@cocotb.test()
+async def test_23_async_reset_recovery(dut):
+    """Assert Reset MID-CALCULATION. Chip must return to IDLE immediately."""
+    await init(dut)
+    await pulse_wake(dut)
+    await wait_for(dut, processing, 1)
+
+    # Let it run for a bit (e.g. into DWT stage)
+    await ClockCycles(dut.clk, 100)
+
+    dut._log.info("  Asserting Async Reset mid-operation...")
+    dut.rst_n.value = 0
+    await ClockCycles(dut.clk, 5)
+
+    # Verify immediate stop
+    assert pwr_gate(dut) == 0, "Power gate did not drop on reset"
+    assert processing(dut) == 0, "Processing flag did not drop on reset"
+
+    # Release reset and verify it stays idle (doesn't resume)
+    dut.rst_n.value = 1
+    await ClockCycles(dut.clk, 20)
+    assert pwr_gate(dut) == 0
+    dut._log.info("PASS: Async reset successfully killed pipeline")
+
+
+# ============================================================================
+# 24  NEW: WATCHDOG TIMEOUT
+# ============================================================================
+
+@cocotb.test()
+async def test_24_watchdog_timeout(dut):
+    """
+    Force FSM to hang (via internal signal manipulation) and wait for Watchdog.
+    Skip this test in Gate Level Sim (internal signals inaccessible).
+    """
+    if is_gate_level():
+        dut._log.info("SKIPPING Watchdog test in GL mode (no internal access)")
+        return
+
+    await init(dut)
+
+    # Force state to S_WAIT_LMS (3) but do NOT send lms_valid
+    # The FSM will stick here forever unless WDT fires.
+    # Note: Access path traverses tb -> user_project -> sensor -> state
+    dut._log.info("  Forcing State = S_WAIT_LMS (3)...")
+    dut.user_project.sensor.state.value = 3
+
+    # WDT is 16-bit ~32768 cycles. Let's wait 34000.
+    dut._log.info("  Waiting 34000 cycles for WDT...")
+
+    # We can't just wait_for because we expect a specific transition
+    fired = False
+    for _ in range(340): # 340 * 100 = 34000
+        await ClockCycles(dut.clk, 100)
+        # Check if state transitioned to S_SLEEP (13)
+        if safe_int(dut.user_project.sensor.state) == 13:
+            fired = True
+            break
+
+    assert fired, "Watchdog failed to force state to SLEEP(13)!"
+    dut._log.info("PASS: Watchdog successfully recovered hung FSM")

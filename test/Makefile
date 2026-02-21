@@ -8,6 +8,9 @@ TOPLEVEL_LANG ?= verilog
 SRC_DIR = $(PWD)/../src
 PROJECT_SOURCES = project.v neurocore_field_sensor.v
 
+# --- CRITICAL FIX: Export GATES so Python test.py can see it ---
+export GATES
+
 ifneq ($(GATES),yes)
 
 # RTL simulation:
