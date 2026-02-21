@@ -129,9 +129,9 @@ module neurocore_field_sensor #(
     localparam S_SLEEP       = 4'd13;
 
     // Watchdog: any WAIT state that exceeds 2^WDT_BITS cycles -> force IDLE
+    // Note: S_LSK_WAIT is excluded — LSK transmission legitimately takes ~3000 cycles
     wire in_wait_state = (state == S_WAIT_LMS)  || (state == S_WAIT_DWT) ||
-                         (state == S_WAIT_ABS)   || (state == S_WAIT_ACCUM) ||
-                         (state == S_LSK_WAIT);
+                         (state == S_WAIT_ABS)   || (state == S_WAIT_ACCUM);
     wire wdt_timeout   = in_wait_state && (&wdt_cnt);  // all-ones
 
     always @(posedge clk or negedge rst_n) begin
