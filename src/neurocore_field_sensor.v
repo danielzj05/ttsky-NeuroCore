@@ -362,16 +362,16 @@ module lms_filter #(
             end
 
             if (processing) begin
-                // FIX #1: Corrected coefficients (symmetric, sum = 1.0)
+                // Corrected coefficients with explicit signed casting
                 case (tap_count)
-                    3'd0: data_out <= data_out + (delay_line[0] >>> 2);  // 0.25
-                    3'd1: data_out <= data_out + (delay_line[1] >>> 3);  // 0.125
-                    3'd2: data_out <= data_out + (delay_line[2] >>> 4);  // 0.0625
-                    3'd3: data_out <= data_out + (delay_line[3] >>> 4);  // 0.0625
-                    3'd4: data_out <= data_out + (delay_line[4] >>> 4);  // 0.0625
-                    3'd5: data_out <= data_out + (delay_line[5] >>> 4);  // 0.0625
-                    3'd6: data_out <= data_out + (delay_line[6] >>> 3);  // 0.125
-                    3'd7: data_out <= data_out + (delay_line[7] >>> 2);  // 0.25
+                    3'd0: data_out <= $signed(data_out) + ($signed(delay_line[0]) >>> 2); // 0.25
+                    3'd1: data_out <= $signed(data_out) + ($signed(delay_line[1]) >>> 3); // 0.125
+                    3'd2: data_out <= $signed(data_out) + ($signed(delay_line[2]) >>> 4); // 0.0625
+                    3'd3: data_out <= $signed(data_out) + ($signed(delay_line[3]) >>> 4); // 0.0625
+                    3'd4: data_out <= $signed(data_out) + ($signed(delay_line[4]) >>> 4); // 0.0625
+                    3'd5: data_out <= $signed(data_out) + ($signed(delay_line[5]) >>> 4); // 0.0625
+                    3'd6: data_out <= $signed(data_out) + ($signed(delay_line[6]) >>> 3); // 0.125
+                    3'd7: data_out <= $signed(data_out) + ($signed(delay_line[7]) >>> 2); // 0.25
                 endcase
 
                 if (tap_count == TAPS[2:0] - 3'd1) begin
@@ -389,7 +389,7 @@ endmodule
 
 // ============================================================================
 // Haar-Lifting DWT Engine (3 levels on 8-sample shift-register buffer)
-// V1 merge: wr_ptr reset on start for robustness after watchdog recovery
+// FIX: Removed wr_ptr reset on start to allow the circular buffer to fill properly
 // ============================================================================
 module dwt_haar_lift #(
     parameter WIDTH = 12
@@ -413,12 +413,10 @@ module dwt_haar_lift #(
 
     reg [WIDTH-1:0] buf_r [0:7];
     reg [2:0]       wr_ptr;
-
     reg [WIDTH-1:0] a0, a1, a2, a3;
     reg [WIDTH-1:0] d0, d1, d2, d3;
     reg [WIDTH-1:0] a2_0, a2_1;
     reg [WIDTH-1:0] d2_0, d2_1;
-
     reg [2:0] step;
     reg       proc;
 
@@ -440,7 +438,8 @@ module dwt_haar_lift #(
             sub_4 <= 0; sub_5 <= 0; sub_6 <= 0; sub_7 <= 0;
             a0 <= 0; a1 <= 0; a2 <= 0; a3 <= 0;
             d0 <= 0; d1 <= 0; d2 <= 0; d3 <= 0;
-            a2_0 <= 0; a2_1 <= 0; d2_0 <= 0; d2_1 <= 0;
+            a2_0 <= 0; a2_1 <= 0;
+            d2_0 <= 0; d2_1 <= 0;
         end else begin
             out_valid <= 0;
 
@@ -455,42 +454,43 @@ module dwt_haar_lift #(
                     if (start && !proc) begin
                         proc   <= 1;
                         step   <= ST_L1;
-                        wr_ptr <= 0;  // V1 merge: defensive reset
+                        // FIX: wr_ptr <= 0 removed. 
+                        // The buffer needs to retain samples across wake events.
                     end
                 end
 
                 // Level 1: 4 Haar pairs from 8 samples
                 ST_L1: begin
-                    d0 <= buf_r[1] - buf_r[0];
-                    a0 <= buf_r[0] + ((buf_r[1] - buf_r[0]) >>> 1);
-                    d1 <= buf_r[3] - buf_r[2];
-                    a1 <= buf_r[2] + ((buf_r[3] - buf_r[2]) >>> 1);
-                    d2 <= buf_r[5] - buf_r[4];
-                    a2 <= buf_r[4] + ((buf_r[5] - buf_r[4]) >>> 1);
-                    d3 <= buf_r[7] - buf_r[6];
-                    a3 <= buf_r[6] + ((buf_r[7] - buf_r[6]) >>> 1);
+                    d0 <= $signed(buf_r[1]) - $signed(buf_r[0]);
+                    a0 <= $signed(buf_r[0]) + (($signed(buf_r[1]) - $signed(buf_r[0])) >>> 1);
+                    d1 <= $signed(buf_r[3]) - $signed(buf_r[2]);
+                    a1 <= $signed(buf_r[2]) + (($signed(buf_r[3]) - $signed(buf_r[2])) >>> 1);
+                    d2 <= $signed(buf_r[5]) - $signed(buf_r[4]);
+                    a2 <= $signed(buf_r[4]) + (($signed(buf_r[5]) - $signed(buf_r[4])) >>> 1);
+                    d3 <= $signed(buf_r[7]) - $signed(buf_r[6]);
+                    a3 <= $signed(buf_r[6]) + (($signed(buf_r[7]) - $signed(buf_r[6])) >>> 1);
                     step <= ST_L2;
                 end
 
                 // Level 2: 2 Haar pairs from 4 approx coefficients
                 ST_L2: begin
-                    d2_0 <= a1 - a0;
-                    a2_0 <= a0 + ((a1 - a0) >>> 1);
-                    d2_1 <= a3 - a2;
-                    a2_1 <= a2 + ((a3 - a2) >>> 1);
+                    d2_0 <= $signed(a1) - $signed(a0);
+                    a2_0 <= $signed(a0) + (($signed(a1) - $signed(a0)) >>> 1);
+                    d2_1 <= $signed(a3) - $signed(a2);
+                    a2_1 <= $signed(a2) + (($signed(a3) - $signed(a2)) >>> 1);
                     step <= ST_L3;
                 end
 
                 // Level 3: 1 Haar pair from 2 level-2 approx
                 ST_L3: begin
-                    sub_1 <= a2_1 - a2_0;                          // L3 detail
-                    sub_0 <= a2_0 + ((a2_1 - a2_0) >>> 1);        // L3 approx
-                    sub_2 <= d2_0;                                  // L2 detail 0
-                    sub_3 <= d2_1;                                  // L2 detail 1
-                    sub_4 <= d0;                                    // L1 detail 0
-                    sub_5 <= d1;                                    // L1 detail 1
-                    sub_6 <= d2;                                    // L1 detail 2
-                    sub_7 <= d3;                                    // L1 detail 3
+                    sub_1 <= $signed(a2_1) - $signed(a2_0);                // L3 detail
+                    sub_0 <= $signed(a2_0) + (($signed(a2_1) - $signed(a2_0)) >>> 1); // L3 approx
+                    sub_2 <= d2_0;                                         // L2 detail 0
+                    sub_3 <= d2_1;                                         // L2 detail 1
+                    sub_4 <= d0;                                           // L1 detail 0
+                    sub_5 <= d1;                                           // L1 detail 1
+                    sub_6 <= d2;                                           // L1 detail 2
+                    sub_7 <= d3;                                           // L1 detail 3
                     step  <= ST_OUT;
                 end
 
@@ -501,7 +501,7 @@ module dwt_haar_lift #(
                 end
 
                 default: step <= ST_IDLE;
-            endcase
+            case
         end
     end
 
