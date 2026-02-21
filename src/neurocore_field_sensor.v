@@ -127,6 +127,7 @@ module neurocore_field_sensor #(
     localparam S_LSK_TX      = 4'd11;
     localparam S_LSK_WAIT    = 4'd12;
     localparam S_SLEEP       = 4'd13;
+    localparam S_LSK_ACK     = 4'd14;
 
     // Watchdog: any WAIT state that exceeds 2^WDT_BITS cycles -> force IDLE
     // Note: S_LSK_WAIT is excluded — LSK transmission legitimately takes ~3000 cycles
@@ -164,7 +165,8 @@ module neurocore_field_sensor #(
                 S_ACCUM:                      next_state = S_WAIT_ACCUM;
                 S_WAIT_ACCUM: if (acc_valid)  next_state = S_ENCODE;
                 S_ENCODE:     if (cmd_ready)  next_state = S_LSK_TX;
-                S_LSK_TX:                     next_state = S_LSK_WAIT;
+                S_LSK_TX:                     next_state = S_LSK_ACK;
+                S_LSK_ACK:                    next_state = S_LSK_WAIT;
                 S_LSK_WAIT:   if (!lsk_tx)    next_state = S_SLEEP;
                 S_SLEEP:                      next_state = S_IDLE;
                 default:                      next_state = S_IDLE;
@@ -182,6 +184,13 @@ module neurocore_field_sensor #(
 
     // cordic_busy is kept for pin compatibility but always 0 now
     assign cordic_busy = 1'b0;
+
+    // Registered tx_start — ensures clean 1-cycle pulse for GL-sim reliability
+    reg tx_start_r;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) tx_start_r <= 1'b0;
+        else        tx_start_r <= (state == S_LSK_TX);
+    end
 
     // ========================================================================
     // LMS Artifact Filter (8-tap, shift-add, sign-extended input)
@@ -282,7 +291,7 @@ module neurocore_field_sensor #(
         .clk      (clk),
         .rst_n    (rst_n),
         .cmd_in   (cmd_encoded),
-        .tx_start (state == S_LSK_TX),
+        .tx_start (tx_start_r),
         .lsk_ctrl (lsk_ctrl),
         .tx_active(lsk_tx)
     );
@@ -659,9 +668,11 @@ module command_encoder #(
             scan_idx  <= 0;
             scanning  <= 0;
         end else begin
-            cmd_ready <= 0;
+            // Only clear cmd_ready when encode_en drops (hold for FSM visibility)
+            if (!encode_en)
+                cmd_ready <= 0;
 
-            if (encode_en && !scanning) begin
+            if (encode_en && !scanning && !cmd_ready) begin
                 max_bin  <= bin_0;
                 max_idx  <= 3'd0;
                 scan_idx <= 4'd1;
@@ -678,7 +689,8 @@ module command_encoder #(
                     default: begin end
                 endcase
 
-                if (scan_idx == 4'd7) begin
+                // Extra cycle (scan_idx 8) ensures max_idx is committed before output
+                if (scan_idx == 4'd8) begin
                     cmd_out   <= max_idx[CMD_WIDTH-1:0];
                     cmd_ready <= 1;
                     scanning  <= 0;

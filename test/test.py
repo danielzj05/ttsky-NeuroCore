@@ -107,8 +107,8 @@ async def run_pipeline(dut, timeout=60000):
         return False
     if not await wait_for(dut, pwr_gate, 0, timeout=timeout):
         return False
-    # Also wait for LSK modulator to fully deassert (can lag FSM by 1 cycle)
-    if not await wait_for(dut, lsk_tx, 0, timeout=200):
+    # Wait for LSK modulator to finish transmission (~3000 cycles for 3-bit cmd)
+    if not await wait_for(dut, lsk_tx, 0, timeout=4000):
         return False
     # Let S_SLEEP → S_IDLE settle
     await ClockCycles(dut.clk, 2)
@@ -274,7 +274,7 @@ async def test_08_lsk_transmission(dut):
 
     await pulse_wake(dut)
 
-    ok = await wait_for(dut, lsk_tx, 1, timeout=200)
+    ok = await wait_for(dut, lsk_tx, 1, timeout=500)
     assert ok, "lsk_tx never asserted"
     dut._log.info("  LSK transmission started")
 
@@ -311,7 +311,7 @@ async def test_09_cmd_valid_pulse(dut):
 
     await pulse_wake(dut)
 
-    ok = await wait_for(dut, cmd_valid, 1, timeout=200)
+    ok = await wait_for(dut, cmd_valid, 1, timeout=500)
     assert ok, "cmd_valid never asserted"
 
     cmd = cmd_out(dut)
