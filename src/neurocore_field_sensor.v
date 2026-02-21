@@ -71,24 +71,24 @@ module neurocore_field_sensor #(
     // ========================================================================
     // Internal Signals
     // ========================================================================
-    wire [LMS_WIDTH-1:0]        lms_out;
-    wire                        lms_valid;
+    wire [LMS_WIDTH-1:0]     lms_out;
+    wire                     lms_valid;
 
-    wire signed [DWT_WIDTH-1:0] dwt_out_0, dwt_out_1, dwt_out_2, dwt_out_3;
-    wire signed [DWT_WIDTH-1:0] dwt_out_4, dwt_out_5, dwt_out_6, dwt_out_7;
-    wire                        dwt_valid;
+    wire [DWT_WIDTH-1:0]     dwt_out_0, dwt_out_1, dwt_out_2, dwt_out_3;
+    wire [DWT_WIDTH-1:0]     dwt_out_4, dwt_out_5, dwt_out_6, dwt_out_7;
+    wire                     dwt_valid;
 
-    wire [MAG_WIDTH-1:0]        mag_0, mag_1, mag_2, mag_3;
-    wire [MAG_WIDTH-1:0]        mag_4, mag_5, mag_6, mag_7;
-    wire                        mag_valid;
+    wire [MAG_WIDTH-1:0]     mag_0, mag_1, mag_2, mag_3;
+    wire [MAG_WIDTH-1:0]     mag_4, mag_5, mag_6, mag_7;
+    wire                     mag_valid;
 
-    wire [POWER_WIDTH-1:0]      power_bins_0, power_bins_1, power_bins_2, power_bins_3;
-    wire [POWER_WIDTH-1:0]      power_bins_4, power_bins_5, power_bins_6, power_bins_7;
-    wire                        acc_valid;
-    wire                        acc_busy_int;
+    wire [POWER_WIDTH-1:0]   power_bins_0, power_bins_1, power_bins_2, power_bins_3;
+    wire [POWER_WIDTH-1:0]   power_bins_4, power_bins_5, power_bins_6, power_bins_7;
+    wire                     acc_valid;
+    wire                     acc_busy_int;
 
-    wire [CMD_WIDTH-1:0]        cmd_encoded;
-    wire                        cmd_ready;
+    wire [CMD_WIDTH-1:0]     cmd_encoded;
+    wire                     cmd_ready;
 
     // ========================================================================
     // Main FSM
@@ -379,9 +379,6 @@ endmodule
 // Coefficients (symmetric, sum to 1.0):
 //   [0.25, 0.125, 0.0625, 0.0625, 0.0625, 0.0625, 0.125, 0.25]
 //   Implemented as right-shifts: [2, 3, 4, 4, 4, 4, 3, 2]
-//
-// Module name kept as lms_filter for port compatibility.
-// This is a fixed FIR filter (no adaptive weight update).
 // ============================================================================
 module lms_filter #(
     parameter TAPS  = 8,
@@ -495,7 +492,7 @@ endmodule
 // Collects 8 input samples, then performs 3-level in-place Haar lifting.
 //
 // Haar lifting per level (operating on pairs):
-//   approx = (even_sample + odd_sample) >>> 1
+//   approx = (even_sample + odd_sample) >> 1   (logical shift, matching original)
 //   detail = even_sample - odd_sample
 //
 // Output mapping:
@@ -512,27 +509,29 @@ module dwt_engine #(
     parameter LEVELS = 3,
     parameter WIDTH  = 12
 ) (
-    input  wire                    clk,
-    input  wire                    rst_n,
-    input  wire signed [WIDTH-1:0] data_in,
-    input  wire                    data_valid,
-    input  wire                    start,
-    output reg  signed [WIDTH-1:0] subband_0,
-    output reg  signed [WIDTH-1:0] subband_1,
-    output reg  signed [WIDTH-1:0] subband_2,
-    output reg  signed [WIDTH-1:0] subband_3,
-    output reg  signed [WIDTH-1:0] subband_4,
-    output reg  signed [WIDTH-1:0] subband_5,
-    output reg  signed [WIDTH-1:0] subband_6,
-    output reg  signed [WIDTH-1:0] subband_7,
-    output reg                     out_valid,
-    output wire                    busy
+    input  wire             clk,
+    input  wire             rst_n,
+    input  wire [WIDTH-1:0] data_in,
+    input  wire             data_valid,
+    input  wire             start,
+    output reg  [WIDTH-1:0] subband_0,
+    output reg  [WIDTH-1:0] subband_1,
+    output reg  [WIDTH-1:0] subband_2,
+    output reg  [WIDTH-1:0] subband_3,
+    output reg  [WIDTH-1:0] subband_4,
+    output reg  [WIDTH-1:0] subband_5,
+    output reg  [WIDTH-1:0] subband_6,
+    output reg  [WIDTH-1:0] subband_7,
+    output reg              out_valid,
+    output wire             busy
 );
 
     localparam NUM_SAMPLES = 8;
 
-    reg signed [WIDTH-1:0] w [0:NUM_SAMPLES-1];
-    reg signed [WIDTH-1:0] s [0:NUM_SAMPLES-1];
+    // Working and snapshot arrays — kept unsigned to match original behavior
+    // Signed arithmetic is done explicitly via sign-extended temporaries
+    reg [WIDTH-1:0] w [0:NUM_SAMPLES-1];
+    reg [WIDTH-1:0] s [0:NUM_SAMPLES-1];
 
     reg [2:0] sample_cnt;
     reg [2:0] proc_level;
@@ -540,6 +539,17 @@ module dwt_engine #(
     reg       proc_active;
 
     assign busy = collecting | proc_active;
+
+    // Signed temporaries for Haar computation
+    // We sign-extend the unsigned w/s values for arithmetic, then truncate back
+    wire signed [WIDTH:0] s0_ext = {s[0][WIDTH-1], s[0]};
+    wire signed [WIDTH:0] s1_ext = {s[1][WIDTH-1], s[1]};
+    wire signed [WIDTH:0] s2_ext = {s[2][WIDTH-1], s[2]};
+    wire signed [WIDTH:0] s3_ext = {s[3][WIDTH-1], s[3]};
+    wire signed [WIDTH:0] s4_ext = {s[4][WIDTH-1], s[4]};
+    wire signed [WIDTH:0] s5_ext = {s[5][WIDTH-1], s[5]};
+    wire signed [WIDTH:0] s6_ext = {s[6][WIDTH-1], s[6]};
+    wire signed [WIDTH:0] s7_ext = {s[7][WIDTH-1], s[7]};
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -606,10 +616,10 @@ module dwt_engine #(
                     end
                     3'd1: begin
                         // Level 1: 8 samples -> 4 approx + 4 detail
-                        w[0] <= (s[0] + s[1]) >>> 1;
-                        w[1] <= (s[2] + s[3]) >>> 1;
-                        w[2] <= (s[4] + s[5]) >>> 1;
-                        w[3] <= (s[6] + s[7]) >>> 1;
+                        w[0] <= (s0_ext + s1_ext) >>> 1;
+                        w[1] <= (s2_ext + s3_ext) >>> 1;
+                        w[2] <= (s4_ext + s5_ext) >>> 1;
+                        w[3] <= (s6_ext + s7_ext) >>> 1;
                         w[4] <= s[0] - s[1];
                         w[5] <= s[2] - s[3];
                         w[6] <= s[4] - s[5];
@@ -624,8 +634,8 @@ module dwt_engine #(
                     end
                     3'd3: begin
                         // Level 2: 4 approx -> 2 approx + 2 detail
-                        w[0] <= (s[0] + s[1]) >>> 1;
-                        w[1] <= (s[2] + s[3]) >>> 1;
+                        w[0] <= (s0_ext + s1_ext) >>> 1;
+                        w[1] <= (s2_ext + s3_ext) >>> 1;
                         w[2] <= s[0] - s[1];
                         w[3] <= s[2] - s[3];
                         proc_level <= 3'd4;
@@ -637,7 +647,7 @@ module dwt_engine #(
                     end
                     3'd5: begin
                         // Level 3: 2 approx -> 1 approx + 1 detail
-                        w[0] <= (s[0] + s[1]) >>> 1;
+                        w[0] <= (s0_ext + s1_ext) >>> 1;
                         w[1] <= s[0] - s[1];
                         proc_level <= 3'd6;
                     end
@@ -668,25 +678,21 @@ endmodule
 // ============================================================================
 // Magnitude Extraction (Absolute Value)
 // ============================================================================
-// Single-cycle registered absolute value. Replaces CORDIC vectoring since
-// Haar DWT coefficients are real-valued (not complex I/Q pairs).
-// ============================================================================
 module magnitude_extract #(
     parameter WIDTH = 12
 ) (
-    input  wire                    clk,
-    input  wire                    rst_n,
-    input  wire                    start,
-    input  wire signed [WIDTH-1:0] in_0, in_1, in_2, in_3,
-    input  wire signed [WIDTH-1:0] in_4, in_5, in_6, in_7,
-    output reg  [WIDTH-1:0]        mag_0, mag_1, mag_2, mag_3,
-    output reg  [WIDTH-1:0]        mag_4, mag_5, mag_6, mag_7,
-    output reg                     out_valid
+    input  wire                clk,
+    input  wire                rst_n,
+    input  wire                start,
+    input  wire [WIDTH-1:0]    in_0, in_1, in_2, in_3,
+    input  wire [WIDTH-1:0]    in_4, in_5, in_6, in_7,
+    output reg  [WIDTH-1:0]    mag_0, mag_1, mag_2, mag_3,
+    output reg  [WIDTH-1:0]    mag_4, mag_5, mag_6, mag_7,
+    output reg                 out_valid
 );
 
-    // Verilator-safe absolute value function
     function automatic [WIDTH-1:0] abs_val;
-        input signed [WIDTH-1:0] val;
+        input [WIDTH-1:0] val;
         begin
             abs_val = val[WIDTH-1] ? (~val + {{(WIDTH-1){1'b0}}, 1'b1}) : val;
         end
@@ -725,9 +731,6 @@ endmodule
 // ============================================================================
 // Power Bin Accumulator (Single Time-Shared Squarer)
 // ============================================================================
-// Iterates one multiplier over 8 channels. Takes 8 cycles.
-// Saves ~7 multipliers (~2000-3500 gates on 135nm).
-// ============================================================================
 module power_accumulator #(
     parameter IN_WIDTH  = 12,
     parameter OUT_WIDTH = 16,
@@ -760,7 +763,7 @@ module power_accumulator #(
 
     assign busy = processing;
 
-    // Next magnitude mux (extracted for lint cleanliness)
+    // Next magnitude mux
     reg [IN_WIDTH-1:0] next_mag;
     always @(*) begin
         case (bin_idx + 3'd1)
@@ -825,8 +828,6 @@ endmodule
 
 // ============================================================================
 // Command Encoder (Sequential Max-Finder)
-// ============================================================================
-// 9 cycles: load bin_0 + compare bins 1-7 + latch result
 // ============================================================================
 module command_encoder #(
     parameter NUM_BINS  = 8,
@@ -917,7 +918,7 @@ module lsk_modulator #(
 
     localparam PACKET_LEN  = 14;
     localparam HALF_PERIOD = BIT_PERIOD / 2;
-    localparam TIMER_W     = $clog2(BIT_PERIOD);
+    localparam TIMER_W     = 10;  // Fixed width: 10 bits holds 0-1023, sufficient for BIT_PERIOD=1000
 
     reg [PACKET_LEN-1:0] packet_reg;
     reg [3:0]            bit_count;
@@ -948,20 +949,20 @@ module lsk_modulator #(
                 transmitting <= 1'b1;
                 tx_active    <= 1'b1;
                 packet_reg   <= full_packet;
-                bit_count    <= PACKET_LEN[3:0] - 4'd1;
+                bit_count    <= 4'd13;
                 bit_timer    <= {TIMER_W{1'b0}};
                 lsk_ctrl     <= full_packet[PACKET_LEN-1];
             end
 
             if (transmitting) begin
-                bit_timer <= bit_timer + {{(TIMER_W-1){1'b0}}, 1'b1};
+                bit_timer <= bit_timer + 10'd1;
 
-                if (bit_timer < HALF_PERIOD[TIMER_W-1:0])
+                if (bit_timer < 10'd500)
                     lsk_ctrl <= packet_reg[bit_count];
                 else
                     lsk_ctrl <= ~packet_reg[bit_count];
 
-                if (bit_timer == BIT_PERIOD[TIMER_W-1:0] - {{(TIMER_W-1){1'b0}}, 1'b1}) begin
+                if (bit_timer == 10'd999) begin
                     bit_timer <= {TIMER_W{1'b0}};
                     if (bit_count == 4'd0) begin
                         transmitting <= 1'b0;
