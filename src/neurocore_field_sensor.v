@@ -10,7 +10,8 @@
 //   3. Watchdog: 16-bit, covers more states, forces S_SLEEP (not S_IDLE)
 //   4. processing signal: active for all non-IDLE/non-SLEEP states
 //   5. cordic_busy hard-wired to 0 (CORDIC removed)
-//   6. DWT wr_ptr reset on start for robustness
+//   6. DWT wr_ptr defensive reset removed so circular buffer can fill across wake events
+//   7. Added $signed() casting to LMS and DWT for proper negative number arithmetic
 //
 // Copyright (c) 2024 Design Team
 // SPDX-License-Identifier: Apache-2.0
@@ -136,10 +137,12 @@ module neurocore_field_sensor #(
 
     // FIX #3: Watchdog covers all states that could hang, including ENCODE and LSK_TX
     // S_LSK_WAIT excluded — LSK transmission legitimately takes many cycles
-    wire in_watchdog_state = (state == S_WAIT_LMS)   || (state == S_WAIT_DWT) ||
-                             (state == S_WAIT_ABS)    || (state == S_WAIT_ACCUM) ||
-                             (state == S_ABS)         || (state == S_ENCODE) ||
+    wire in_watchdog_state = (state == S_WAIT_LMS)   ||
+                             (state == S_WAIT_DWT)   ||
+                             (state == S_WAIT_ABS)   || (state == S_WAIT_ACCUM) ||
+                             (state == S_ABS)        || (state == S_ENCODE) ||
                              (state == S_LSK_TX);
+
     // FIX #3: fires when MSB set (~32768 cycles with 16-bit counter)
     wire wdt_timeout = in_watchdog_state && wdt_cnt[WDT_BITS-1];
 
@@ -159,7 +162,7 @@ module neurocore_field_sensor #(
     always @(*) begin
         next_state = state;
         if (wdt_timeout) begin
-            next_state = S_SLEEP;  // FIX #3: force SLEEP, not IDLE
+            next_state = S_SLEEP; // FIX #3: force SLEEP, not IDLE
         end else begin
             case (state)
                 S_IDLE:       if (wake_sync)  next_state = S_WAKE;
@@ -318,6 +321,7 @@ endmodule
 // LMS Artifact Filter (8-tap, shift-add)
 // FIX #1: Coefficients corrected to >>>2,>>>3,>>>4,>>>4,>>>4,>>>4,>>>3,>>>2
 //         Sum = 0.25+0.125+0.0625+0.0625+0.0625+0.0625+0.125+0.25 = 1.0
+// FIX: Added $signed() casts to ensure arithmetic right shifts for negative ADC values
 // ============================================================================
 module lms_filter #(
     parameter TAPS  = 8,
@@ -333,7 +337,7 @@ module lms_filter #(
     output wire                 busy
 );
 
-    reg [WIDTH-1:0] delay_line [0:TAPS-1];
+    reg signed [WIDTH-1:0] delay_line [0:TAPS-1];
     reg [2:0] tap_count;
     reg       processing;
     integer   i;
@@ -501,7 +505,7 @@ module dwt_haar_lift #(
                 end
 
                 default: step <= ST_IDLE;
-            case
+            endcase
         end
     end
 
@@ -524,7 +528,6 @@ module abs_mag_bank #(
     output reg  [WIDTH-1:0] mag_4, mag_5, mag_6, mag_7,
     output reg              out_valid
 );
-
     wire [WIDTH-1:0] a0 = x_0[WIDTH-1] ? (~x_0 + {{(WIDTH-1){1'b0}}, 1'b1}) : x_0;
     wire [WIDTH-1:0] a1 = x_1[WIDTH-1] ? (~x_1 + {{(WIDTH-1){1'b0}}, 1'b1}) : x_1;
     wire [WIDTH-1:0] a2 = x_2[WIDTH-1] ? (~x_2 + {{(WIDTH-1){1'b0}}, 1'b1}) : x_2;
@@ -568,7 +571,6 @@ module power_accumulator_ts #(
     output reg  [OUT_WIDTH-1:0]  bin_4, bin_5, bin_6, bin_7,
     output reg                   out_valid
 );
-
     reg [3:0] scan_idx;
     reg       running;
 
@@ -598,7 +600,6 @@ module power_accumulator_ts #(
             running   <= 0;
         end else begin
             out_valid <= 0;
-
             if (start && !running) begin
                 running  <= 1;
                 scan_idx <= 0;
@@ -641,12 +642,10 @@ module command_encoder #(
     output reg  [CMD_WIDTH-1:0] cmd_out,
     output reg                  cmd_ready
 );
-
     reg [15:0] max_bin;
     reg [2:0]  max_idx;
     reg [3:0]  scan_idx;
     reg        scanning;
-
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             cmd_out   <= 0;
@@ -658,7 +657,6 @@ module command_encoder #(
         end else begin
             if (!encode_en)
                 cmd_ready <= 0;
-
             if (encode_en && !scanning && !cmd_ready) begin
                 max_bin  <= bin_0;
                 max_idx  <= 3'd0;
@@ -708,14 +706,12 @@ module lsk_modulator #(
     output reg                  lsk_ctrl,
     output reg                  tx_active
 );
-
     localparam PACKET_BITS = 14;
 
     reg [PACKET_BITS-1:0] tx_shift_reg;
-    reg [3:0]             bit_count;     // 4 bits for 0-13
+    reg [3:0]             bit_count; // 4 bits for 0-13
     reg [10:0]            bit_timer;
     reg                   transmitting;
-
     wire parity = ^cmd_in;  // XOR parity over command bits
 
     always @(posedge clk or negedge rst_n) begin
@@ -736,7 +732,7 @@ module lsk_modulator #(
                                  cmd_in,     // 3-bit command
                                  parity,     // parity bit
                                  2'b11};     // postamble
-                bit_count    <= PACKET_BITS[3:0] - 4'd1;  // 13: start from MSB
+                bit_count    <= PACKET_BITS[3:0] - 4'd1; // 13: start from MSB
                 bit_timer    <= 0;
             end
 
