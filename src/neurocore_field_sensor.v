@@ -42,9 +42,9 @@ module neurocore_field_sensor #(
     output wire                  lsk_ctrl,
     output wire                  lsk_tx,
     output wire                  pwr_gate_ctrl,
-    output wire                  fir_busy,
+    output wire                  lms_busy,
     output wire                  dwt_busy,
-    output wire                  acc_busy,
+    output wire                  cordic_busy,
     output wire                  processing
 );
 
