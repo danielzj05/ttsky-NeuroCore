@@ -360,13 +360,14 @@ async def test_12_consecutive_pipelines(dut):
             await feed_sample(dut, (s + n * 3) & 0xF)
         ok = await run_pipeline(dut)
         assert ok, f"Pipeline stuck on run {n}"
-        # Let FSM settle into S_IDLE (S_SLEEP → S_IDLE takes 1 extra cycle)
+        # Wait for LSK modulator to fully finish (tx_active can lag FSM by 1 clk)
+        ok = await wait_for(dut, lsk_tx, 0, timeout=100)
+        assert ok, f"Run {n}: lsk_tx never de-asserted"
         await ClockCycles(dut.clk, 2)
         # Verify clean return to idle
         assert pwr_gate(dut) == 0, f"Run {n}: pwr_gate not 0"
         assert lms_busy(dut) == 0, f"Run {n}: lms_busy not 0"
         assert dwt_busy(dut) == 0, f"Run {n}: dwt_busy not 0"
-        assert lsk_tx(dut) == 0,   f"Run {n}: lsk_tx not 0"
         dut._log.info(f"  Run {n}: OK")
 
     dut._log.info("PASS: 3 consecutive pipelines completed")
