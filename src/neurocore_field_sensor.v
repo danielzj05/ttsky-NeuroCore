@@ -1,11 +1,16 @@
 // ============================================================================
-// NeuroCore Field Sensor - Ultra-Low-Power Digital Core  (Expert Refactor v2)
+// NeuroCore Field Sensor - Ultra-Low-Power Digital Core  (Merged & Corrected)
 // ============================================================================
-// Refactors applied:
-//   1. DWT: proper Haar-lifting on 8-sample shift-register buffer
-//   2. CORDIC replaced with combinational absolute-value (real-valued subbands)
-//   3. Power accumulator: single time-shared multiplier (8-cycle scan)
-//   4. Signal integrity: 2-FF synchronizers, sign-extension, 10-bit watchdog
+// Merges:
+//   - Version 2's clean 1-cycle tx_start_r pulse
+//   - Version 1's defensive wr_ptr reset in DWT
+// Fixes applied:
+//   1. FIR coefficients corrected to >>>2,>>>3,>>>4,>>>4,>>>4,>>>4,>>>3,>>>2
+//   2. LSK modulator: full 14-bit Manchester packet (preamble/sync/cmd/parity/postamble, MSB-first)
+//   3. Watchdog: 16-bit, covers more states, forces S_SLEEP (not S_IDLE)
+//   4. processing signal: active for all non-IDLE/non-SLEEP states
+//   5. cordic_busy mapped to accumulator activity
+//   6. DWT wr_ptr reset on start for robustness
 //
 // Copyright (c) 2024 Design Team
 // SPDX-License-Identifier: Apache-2.0
@@ -26,7 +31,7 @@ module neurocore_field_sensor #(
     /* verilator lint_on UNUSEDPARAM */
     parameter CMD_WIDTH     = 3,
     parameter ADC_BITS      = 4,
-    parameter WDT_BITS      = 10  // Watchdog width (1024 cycles max)
+    parameter WDT_BITS      = 16  // FIX #3: 16-bit watchdog (~32768 cycle timeout)
 ) (
     input  wire                  clk,
     input  wire                  rst_n,
@@ -57,7 +62,7 @@ module neurocore_field_sensor #(
 );
 
     // ========================================================================
-    // 4. Two-Flip-Flop Synchronizers for async inputs (wake, adc_valid)
+    // Two-Flip-Flop Synchronizers for async inputs (wake, adc_valid)
     // ========================================================================
     reg wake_meta, wake_sync;
     reg adc_valid_meta, adc_valid_sync;
@@ -129,11 +134,14 @@ module neurocore_field_sensor #(
     localparam S_SLEEP       = 4'd13;
     localparam S_LSK_ACK     = 4'd14;
 
-    // Watchdog: any WAIT state that exceeds 2^WDT_BITS cycles -> force IDLE
-    // Note: S_LSK_WAIT is excluded — LSK transmission legitimately takes ~3000 cycles
-    wire in_wait_state = (state == S_WAIT_LMS)  || (state == S_WAIT_DWT) ||
-                         (state == S_WAIT_ABS)   || (state == S_WAIT_ACCUM);
-    wire wdt_timeout   = in_wait_state && (&wdt_cnt);  // all-ones
+    // FIX #3: Watchdog covers all states that could hang, including ENCODE and LSK_TX
+    // S_LSK_WAIT excluded — LSK transmission legitimately takes ~14,000 cycles
+    wire in_watchdog_state = (state == S_WAIT_LMS)   || (state == S_WAIT_DWT) ||
+                             (state == S_WAIT_ABS)    || (state == S_WAIT_ACCUM) ||
+                             (state == S_ABS)         || (state == S_ENCODE) ||
+                             (state == S_LSK_TX);
+    // FIX #3: fires when MSB set (~32768 cycles with 16-bit counter)
+    wire wdt_timeout = in_watchdog_state && wdt_cnt[WDT_BITS-1];
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -141,7 +149,7 @@ module neurocore_field_sensor #(
             wdt_cnt <= {WDT_BITS{1'b0}};
         end else begin
             state <= next_state;
-            if (in_wait_state)
+            if (in_watchdog_state)
                 wdt_cnt <= wdt_cnt + {{(WDT_BITS-1){1'b0}}, 1'b1};
             else
                 wdt_cnt <= {WDT_BITS{1'b0}};
@@ -151,7 +159,7 @@ module neurocore_field_sensor #(
     always @(*) begin
         next_state = state;
         if (wdt_timeout) begin
-            next_state = S_IDLE;
+            next_state = S_SLEEP;  // FIX #3: force SLEEP, not IDLE
         end else begin
             case (state)
                 S_IDLE:       if (wake_sync)  next_state = S_WAKE;
@@ -175,17 +183,19 @@ module neurocore_field_sensor #(
     end
 
     // Control pulses
-    assign lms_start    = (state == S_LMS);
-    assign dwt_start    = (state == S_DWT);
-    assign abs_start    = (state == S_ABS);
-    assign acc_start    = (state == S_ACCUM);
+    assign lms_start     = (state == S_LMS);
+    assign dwt_start     = (state == S_DWT);
+    assign abs_start     = (state == S_ABS);
+    assign acc_start     = (state == S_ACCUM);
     assign pwr_gate_ctrl = (state != S_IDLE) && (state != S_SLEEP);
-    assign processing    = lms_busy | dwt_busy;
 
-    // cordic_busy is kept for pin compatibility but always 0 now
-    assign cordic_busy = 1'b0;
+    // FIX #4: processing active for entire pipeline, not just LMS+DWT
+    assign processing = (state != S_IDLE) && (state != S_SLEEP);
 
-    // Registered tx_start — ensures clean 1-cycle pulse for GL-sim reliability
+    // FIX #5: cordic_busy maps to accumulator activity for debug visibility
+    assign cordic_busy = (state == S_ACCUM) || (state == S_WAIT_ACCUM);
+
+    // V2 merge: clean 1-cycle registered tx_start pulse
     reg tx_start_r;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) tx_start_r <= 1'b0;
@@ -201,7 +211,6 @@ module neurocore_field_sensor #(
     ) u_lms_filter (
         .clk       (clk),
         .rst_n     (rst_n),
-        // 4. Sign-extend ADC data (bipolar signals)
         .data_in   ({{(LMS_WIDTH-ADC_BITS){adc_data[ADC_BITS-1]}}, adc_data}),
         .data_valid(adc_valid_sync),
         .start     (lms_start),
@@ -211,14 +220,13 @@ module neurocore_field_sensor #(
     );
 
     // ========================================================================
-    // 1. DWT: Haar Lifting on 8-sample buffer (3 levels)
+    // DWT: Haar Lifting on 8-sample buffer (3 levels)
     // ========================================================================
     dwt_haar_lift #(
         .WIDTH (DWT_WIDTH)
     ) u_dwt (
         .clk       (clk),
         .rst_n     (rst_n),
-        // Sign-extend LMS output into DWT width
         .data_in   ({{(DWT_WIDTH-LMS_WIDTH){lms_out[LMS_WIDTH-1]}}, lms_out}),
         .data_valid(lms_valid),
         .start     (dwt_start),
@@ -235,7 +243,7 @@ module neurocore_field_sensor #(
     );
 
     // ========================================================================
-    // 2. Absolute-Value Magnitude (replaces CORDIC)
+    // Absolute-Value Magnitude (replaces CORDIC)
     // ========================================================================
     abs_mag_bank #(
         .WIDTH (DWT_WIDTH)
@@ -251,7 +259,7 @@ module neurocore_field_sensor #(
     );
 
     // ========================================================================
-    // 3. Power Accumulator — single time-shared multiplier
+    // Power Accumulator — single time-shared multiplier
     // ========================================================================
     power_accumulator_ts #(
         .IN_WIDTH (DWT_WIDTH),
@@ -268,7 +276,7 @@ module neurocore_field_sensor #(
     );
 
     // ========================================================================
-    // Command Encoder (sequential scan, unchanged)
+    // Command Encoder (sequential scan)
     // ========================================================================
     command_encoder #(
         .CMD_WIDTH(CMD_WIDTH)
@@ -283,7 +291,7 @@ module neurocore_field_sensor #(
     );
 
     // ========================================================================
-    // LSK Modulator (unchanged)
+    // LSK Modulator (14-bit Manchester packet)
     // ========================================================================
     lsk_modulator #(
         .CMD_WIDTH(CMD_WIDTH)
@@ -307,7 +315,9 @@ endmodule
 // ############################################################################
 
 // ============================================================================
-// LMS Artifact Filter (8-tap, shift-add — unchanged from previous revision)
+// LMS Artifact Filter (8-tap, shift-add)
+// FIX #1: Coefficients corrected to >>>2,>>>3,>>>4,>>>4,>>>4,>>>4,>>>3,>>>2
+//         Sum = 0.25+0.125+0.0625+0.0625+0.0625+0.0625+0.125+0.25 = 1.0
 // ============================================================================
 module lms_filter #(
     parameter TAPS  = 8,
@@ -352,15 +362,16 @@ module lms_filter #(
             end
 
             if (processing) begin
+                // FIX #1: Corrected coefficients (symmetric, sum = 1.0)
                 case (tap_count)
-                    3'd0: data_out <= data_out + (delay_line[0] >>> 1);
-                    3'd1: data_out <= data_out + (delay_line[1] >>> 2);
-                    3'd2: data_out <= data_out + (delay_line[2] >>> 3);
-                    3'd3: data_out <= data_out + (delay_line[3] >>> 4);
-                    3'd4: data_out <= data_out + (delay_line[4] >>> 4);
-                    3'd5: data_out <= data_out + (delay_line[5] >>> 3);
-                    3'd6: data_out <= data_out + (delay_line[6] >>> 2);
-                    3'd7: data_out <= data_out + (delay_line[7] >>> 1);
+                    3'd0: data_out <= data_out + (delay_line[0] >>> 2);  // 0.25
+                    3'd1: data_out <= data_out + (delay_line[1] >>> 3);  // 0.125
+                    3'd2: data_out <= data_out + (delay_line[2] >>> 4);  // 0.0625
+                    3'd3: data_out <= data_out + (delay_line[3] >>> 4);  // 0.0625
+                    3'd4: data_out <= data_out + (delay_line[4] >>> 4);  // 0.0625
+                    3'd5: data_out <= data_out + (delay_line[5] >>> 4);  // 0.0625
+                    3'd6: data_out <= data_out + (delay_line[6] >>> 3);  // 0.125
+                    3'd7: data_out <= data_out + (delay_line[7] >>> 2);  // 0.25
                 endcase
 
                 if (tap_count == TAPS[2:0] - 3'd1) begin
@@ -377,15 +388,8 @@ endmodule
 
 
 // ============================================================================
-// 1. Haar-Lifting DWT Engine (3 levels on 8-sample shift-register buffer)
-// ============================================================================
-// Collects 8 samples via data_valid, then on 'start' performs 3-level Haar:
-//   Level 1 (4 pairs): d[n] = x[2n+1] - x[2n],  s[n] = x[2n] + (d[n]>>>1)
-//   Level 2 (2 pairs of s): repeat
-//   Level 3 (1 pair of s):  repeat
-// Outputs: sub_0 = final approx, sub_1..sub_3 = details L3-L1,
-//          sub_4..sub_7 = level-1 details (all 4)
-// Uses a single sequential FSM — no nesting.
+// Haar-Lifting DWT Engine (3 levels on 8-sample shift-register buffer)
+// V1 merge: wr_ptr reset on start for robustness after watchdog recovery
 // ============================================================================
 module dwt_haar_lift #(
     parameter WIDTH = 12
@@ -407,14 +411,11 @@ module dwt_haar_lift #(
     output wire                 busy
 );
 
-    // 8-sample shift register buffer
     reg [WIDTH-1:0] buf_r [0:7];
     reg [2:0]       wr_ptr;
 
-    // Working registers for lifting (4 approx + 4 detail per level)
     reg [WIDTH-1:0] a0, a1, a2, a3;
     reg [WIDTH-1:0] d0, d1, d2, d3;
-    // Level-2 intermediates
     reg [WIDTH-1:0] a2_0, a2_1;
     reg [WIDTH-1:0] d2_0, d2_1;
 
@@ -422,9 +423,9 @@ module dwt_haar_lift #(
     reg       proc;
 
     localparam ST_IDLE = 3'd0,
-               ST_L1   = 3'd1,  // level-1 pairs
-               ST_L2   = 3'd2,  // level-2 pairs
-               ST_L3   = 3'd3,  // level-3 pair
+               ST_L1   = 3'd1,
+               ST_L2   = 3'd2,
+               ST_L3   = 3'd3,
                ST_OUT  = 3'd4;
 
     assign busy = proc;
@@ -452,8 +453,9 @@ module dwt_haar_lift #(
             case (step)
                 ST_IDLE: begin
                     if (start && !proc) begin
-                        proc <= 1;
-                        step <= ST_L1;
+                        proc   <= 1;
+                        step   <= ST_L1;
+                        wr_ptr <= 0;  // V1 merge: defensive reset
                     end
                 end
 
@@ -481,10 +483,6 @@ module dwt_haar_lift #(
 
                 // Level 3: 1 Haar pair from 2 level-2 approx
                 ST_L3: begin
-                    // Final outputs:
-                    // sub_0 = L3 approx, sub_1 = L3 detail
-                    // sub_2 = L2 detail 0, sub_3 = L2 detail 1
-                    // sub_4..sub_7 = L1 details d0..d3
                     sub_1 <= a2_1 - a2_0;                          // L3 detail
                     sub_0 <= a2_0 + ((a2_1 - a2_0) >>> 1);        // L3 approx
                     sub_2 <= d2_0;                                  // L2 detail 0
@@ -511,9 +509,7 @@ endmodule
 
 
 // ============================================================================
-// 2. Absolute-Value Magnitude Bank (replaces CORDIC)
-// ============================================================================
-// For real-valued DWT subbands, |x| is the mathematically correct magnitude.
+// Absolute-Value Magnitude Bank (replaces CORDIC)
 // Single-cycle combinational with registered output.
 // ============================================================================
 module abs_mag_bank #(
@@ -529,7 +525,6 @@ module abs_mag_bank #(
     output reg              out_valid
 );
 
-    // Combinational absolute value
     wire [WIDTH-1:0] a0 = x_0[WIDTH-1] ? (~x_0 + {{(WIDTH-1){1'b0}}, 1'b1}) : x_0;
     wire [WIDTH-1:0] a1 = x_1[WIDTH-1] ? (~x_1 + {{(WIDTH-1){1'b0}}, 1'b1}) : x_1;
     wire [WIDTH-1:0] a2 = x_2[WIDTH-1] ? (~x_2 + {{(WIDTH-1){1'b0}}, 1'b1}) : x_2;
@@ -558,11 +553,7 @@ endmodule
 
 
 // ============================================================================
-// 3. Power Accumulator — Single Time-Shared Multiplier
-// ============================================================================
-// One multiplier cycles through 8 magnitude inputs (scan_idx 0..7).
-// Total latency: 9 cycles (1 start + 8 multiply-accumulate).
-// Saves ~2000+ gates vs. 8 parallel multipliers.
+// Power Accumulator — Single Time-Shared Multiplier
 // ============================================================================
 module power_accumulator_ts #(
     parameter IN_WIDTH  = 12,
@@ -581,7 +572,6 @@ module power_accumulator_ts #(
     reg [3:0] scan_idx;
     reg       running;
 
-    // Mux: select current magnitude based on scan_idx
     reg [IN_WIDTH-1:0] cur_mag;
     always @(*) begin
         case (scan_idx[2:0])
@@ -596,7 +586,6 @@ module power_accumulator_ts #(
         endcase
     end
 
-    // Single shared multiplier: mag^2, right-shift to fit OUT_WIDTH
     wire [2*IN_WIDTH-1:0] sq_full = cur_mag * cur_mag;
     wire [OUT_WIDTH-1:0]  sq_trunc = sq_full[2*IN_WIDTH-1 : 2*IN_WIDTH-OUT_WIDTH];
 
@@ -614,7 +603,6 @@ module power_accumulator_ts #(
                 running  <= 1;
                 scan_idx <= 0;
             end else if (running) begin
-                // Store result into corresponding bin
                 case (scan_idx[2:0])
                     3'd0: bin_0 <= sq_trunc;
                     3'd1: bin_1 <= sq_trunc;
@@ -640,7 +628,7 @@ endmodule
 
 
 // ============================================================================
-// Command Encoder (sequential scan — structurally unchanged)
+// Command Encoder (sequential scan)
 // ============================================================================
 module command_encoder #(
     parameter CMD_WIDTH = 3
@@ -668,7 +656,6 @@ module command_encoder #(
             scan_idx  <= 0;
             scanning  <= 0;
         end else begin
-            // Only clear cmd_ready when encode_en drops (hold for FSM visibility)
             if (!encode_en)
                 cmd_ready <= 0;
 
@@ -689,7 +676,6 @@ module command_encoder #(
                     default: begin end
                 endcase
 
-                // Extra cycle (scan_idx 8) ensures max_idx is committed before output
                 if (scan_idx == 4'd8) begin
                     cmd_out   <= max_idx[CMD_WIDTH-1:0];
                     cmd_ready <= 1;
@@ -705,7 +691,10 @@ endmodule
 
 
 // ============================================================================
-// LSK Modulator (structurally unchanged)
+// FIX #2: LSK Modulator — Full 14-bit Manchester Packet
+// Packet format (MSB-first, bit_count 13 down to 0):
+//   [1010 preamble][1100 sync][3-bit cmd][parity][11 postamble]
+// Manchester encoding: first half of BIT_PERIOD = data, second half = ~data
 // ============================================================================
 module lsk_modulator #(
     parameter CMD_WIDTH  = 3,
@@ -719,10 +708,14 @@ module lsk_modulator #(
     output reg                  tx_active
 );
 
-    reg [CMD_WIDTH-1:0] tx_shift_reg;
-    reg [2:0]           bit_count;
-    reg [10:0]          bit_timer;
-    reg                 transmitting;
+    localparam PACKET_BITS = 14;
+
+    reg [PACKET_BITS-1:0] tx_shift_reg;
+    reg [3:0]             bit_count;     // 4 bits for 0-13
+    reg [10:0]            bit_timer;
+    reg                   transmitting;
+
+    wire parity = ^cmd_in;  // XOR parity over command bits
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -731,32 +724,37 @@ module lsk_modulator #(
             transmitting <= 0;
             bit_count    <= 0;
             bit_timer    <= 0;
+            tx_shift_reg <= 0;
         end else begin
             if (tx_start && !transmitting) begin
                 transmitting <= 1;
                 tx_active    <= 1;
-                tx_shift_reg <= cmd_in;
-                bit_count    <= CMD_WIDTH[2:0];
+                // Build packet: [13:10]=preamble, [9:6]=sync, [5:3]=cmd, [2]=parity, [1:0]=postamble
+                tx_shift_reg <= {4'b1010,    // preamble
+                                 4'b1100,    // sync
+                                 cmd_in,     // 3-bit command
+                                 parity,     // parity bit
+                                 2'b11};     // postamble
+                bit_count    <= PACKET_BITS[3:0] - 4'd1;  // 13: start from MSB
                 bit_timer    <= 0;
             end
 
             if (transmitting) begin
                 if (bit_timer < BIT_PERIOD[10:0] - 11'd1) begin
                     bit_timer <= bit_timer + 11'd1;
+                    // Manchester: first half = data bit, second half = inverted
                     if (bit_timer < BIT_PERIOD[10:0] / 2)
-                        lsk_ctrl <= tx_shift_reg[0];
+                        lsk_ctrl <= tx_shift_reg[bit_count];
                     else
-                        lsk_ctrl <= ~tx_shift_reg[0];
+                        lsk_ctrl <= ~tx_shift_reg[bit_count];
                 end else begin
-                    bit_timer    <= 0;
-                    tx_shift_reg <= {1'b0, tx_shift_reg[CMD_WIDTH-1:1]};
-
-                    if (bit_count == 3'd1) begin
+                    bit_timer <= 0;
+                    if (bit_count == 4'd0) begin
                         transmitting <= 0;
                         tx_active    <= 0;
                         lsk_ctrl     <= 0;
                     end else begin
-                        bit_count <= bit_count - 3'd1;
+                        bit_count <= bit_count - 4'd1;
                     end
                 end
             end
