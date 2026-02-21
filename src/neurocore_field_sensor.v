@@ -9,7 +9,7 @@
 //   2. LSK modulator: full 14-bit Manchester packet (preamble/sync/cmd/parity/postamble, MSB-first)
 //   3. Watchdog: 16-bit, covers more states, forces S_SLEEP (not S_IDLE)
 //   4. processing signal: active for all non-IDLE/non-SLEEP states
-//   5. cordic_busy mapped to accumulator activity
+//   5. cordic_busy hard-wired to 0 (CORDIC removed)
 //   6. DWT wr_ptr reset on start for robustness
 //
 // Copyright (c) 2024 Design Team
@@ -135,7 +135,7 @@ module neurocore_field_sensor #(
     localparam S_LSK_ACK     = 4'd14;
 
     // FIX #3: Watchdog covers all states that could hang, including ENCODE and LSK_TX
-    // S_LSK_WAIT excluded — LSK transmission legitimately takes ~14,000 cycles
+    // S_LSK_WAIT excluded — LSK transmission legitimately takes many cycles
     wire in_watchdog_state = (state == S_WAIT_LMS)   || (state == S_WAIT_DWT) ||
                              (state == S_WAIT_ABS)    || (state == S_WAIT_ACCUM) ||
                              (state == S_ABS)         || (state == S_ENCODE) ||
@@ -192,8 +192,8 @@ module neurocore_field_sensor #(
     // FIX #4: processing active for entire pipeline, not just LMS+DWT
     assign processing = (state != S_IDLE) && (state != S_SLEEP);
 
-    // FIX #5: cordic_busy maps to accumulator activity for debug visibility
-    assign cordic_busy = (state == S_ACCUM) || (state == S_WAIT_ACCUM);
+    // FIX #5: cordic_busy hard-wired to 0 (CORDIC removed from design)
+    assign cordic_busy = 1'b0;
 
     // V2 merge: clean 1-cycle registered tx_start pulse
     reg tx_start_r;
@@ -695,10 +695,11 @@ endmodule
 // Packet format (MSB-first, bit_count 13 down to 0):
 //   [1010 preamble][1100 sync][3-bit cmd][parity][11 postamble]
 // Manchester encoding: first half of BIT_PERIOD = data, second half = ~data
+// BIT_PERIOD = 200 → total TX ≈ 14 × 200 = 2800 cycles
 // ============================================================================
 module lsk_modulator #(
     parameter CMD_WIDTH  = 3,
-    parameter BIT_PERIOD = 1000
+    parameter BIT_PERIOD = 200
 ) (
     input  wire                 clk,
     input  wire                 rst_n,
