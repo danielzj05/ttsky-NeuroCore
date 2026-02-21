@@ -685,17 +685,29 @@ async def test_15_all_zeros(dut):
 # =============================================================================
 @cocotb.test()
 async def test_16_max_constant(dut):
-    """Constant maximum value (15). DC -> cmd=0."""
+    """
+    Constant signed -1 input. First pass primes the FIR delay line.
+    Second pass should produce truly constant FIR output -> cmd=0.
+    """
     await setup_dut(dut)
     
-    result = await run_full_pipeline(dut, [15] * 8)
+    # First pass: primes FIR delay line with -1 values
+    # (delay line starts at 0, so outputs ramp during fill)
+    result1 = await run_full_pipeline(dut, [15] * 8)
+    dut._log.info(f"Priming pass -> cmd={result1['cmd']} (transient expected)")
+    await wait_for_sleep(dut)
+    await ClockCycles(dut.clk, 10)
     
-    dut._log.info(f"All-15 -> cmd={result['cmd']}")
-    assert result['cmd'] == 0, f"Expected cmd=0 for constant input, got {result['cmd']}"
+    # Second pass: delay line already full of -1
+    # All 8 FIR outputs should be identical -> DWT detail = 0 -> cmd=0
+    result2 = await run_full_pipeline(dut, [15] * 8)
+    dut._log.info(f"Primed pass -> cmd={result2['cmd']}")
+    assert result2['cmd'] == 0, (
+        f"With primed FIR, constant -1 should give cmd=0, got {result2['cmd']}"
+    )
     
     await wait_for_sleep(dut)
-    dut._log.info("PASS: Constant max -> cmd=0")
-
+    dut._log.info("PASS: Primed constant -1 -> cmd=0")
 
 # =============================================================================
 # Test 17: Ramp Input
