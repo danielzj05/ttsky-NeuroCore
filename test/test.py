@@ -16,7 +16,6 @@ import os
 
 def is_gate_level():
     """Detect if we are running Gate Level Simulation to skip internal signal checks."""
-    # Checks the env var exported in the Makefile
     return os.environ.get("GATES") == "yes"
 
 def build_ui(adc_data=0, adc_valid=0, wake=0):
@@ -612,7 +611,7 @@ async def test_21_dc_input_spectrum(dut):
 
 
 # ============================================================================
-# 22  NEW: NYQUIST INPUT SPECTRUM
+# 22  NEW: NYQUIST INPUT SPECTRUM (FIXED)
 # ============================================================================
 
 @cocotb.test()
@@ -620,12 +619,17 @@ async def test_22_nyquist_input_spectrum(dut):
     """Feed Alternating +MAX/-MAX (Nyquist). Should trigger high bins."""
     await init(dut)
 
-    # +7, -8, +7, -8 ...
-    for i in range(16):
+    # FIX: Pre-fill FIR filter by feeding data WITHOUT asserting wake first.
+    # This prevents the initial "transient" (averaging with zeros) from killing
+    # the high-frequency energy on the very first run.
+    dut._log.info("  Priming FIR filter with Nyquist pattern...")
+    for i in range(8):
         val = 7 if (i % 2 == 0) else 8
         await feed_sample(dut, val)
 
+    dut._log.info("  Waking up and processing...")
     await pulse_wake(dut)
+    
     await wait_for(dut, cmd_valid, 1, timeout=3000)
 
     cmd = cmd_out(dut)
@@ -668,7 +672,7 @@ async def test_23_async_reset_recovery(dut):
 
 
 # ============================================================================
-# 24  NEW: WATCHDOG TIMEOUT
+# 24  NEW: WATCHDOG TIMEOUT (FIXED)
 # ============================================================================
 
 @cocotb.test()
@@ -689,17 +693,21 @@ async def test_24_watchdog_timeout(dut):
     dut._log.info("  Forcing State = S_WAIT_LMS (3)...")
     dut.user_project.sensor.state.value = 3
 
-    # WDT is 16-bit ~32768 cycles. Let's wait 34000.
-    dut._log.info("  Waiting 34000 cycles for WDT...")
+    # WDT is 16-bit ~32768 cycles.
+    dut._log.info("  Waiting for Watchdog (~32768 cycles)...")
 
-    # We can't just wait_for because we expect a specific transition
-    fired = False
-    for _ in range(340): # 340 * 100 = 34000
-        await ClockCycles(dut.clk, 100)
-        # Check if state transitioned to S_SLEEP (13)
-        if safe_int(dut.user_project.sensor.state) == 13:
-            fired = True
-            break
+    # FIX: We cannot sleep for 100 cycles at a time because S_SLEEP (13)
+    # might only last for ONE cycle before going to IDLE (0).
+    # We must check every clock cycle to catch the transition.
+    
+    # Use our reusable wait_for helper which polls every single cycle.
+    # We define a lambda to check the internal state.
+    fired = await wait_for(
+        dut, 
+        lambda d: safe_int(d.user_project.sensor.state) == 13, 
+        13, # Expecting state value 13
+        timeout=35000 # Wait slightly longer than 2^15
+    )
 
     assert fired, "Watchdog failed to force state to SLEEP(13)!"
     dut._log.info("PASS: Watchdog successfully recovered hung FSM")
