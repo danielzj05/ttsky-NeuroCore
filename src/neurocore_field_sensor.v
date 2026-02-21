@@ -21,8 +21,8 @@
 // Top-Level Module
 // ============================================================================
 module neurocore_field_sensor #(
-    parameter FIR_TAPS      = 8,
-    parameter FIR_WIDTH     = 8,
+    parameter LMS_TAPS      = 8,
+    parameter LMS_WIDTH     = 8,
     parameter DWT_LEVELS    = 3,
     parameter DWT_WIDTH     = 12,
     parameter NUM_BINS      = 8,
@@ -32,16 +32,29 @@ module neurocore_field_sensor #(
     parameter POWER_WIDTH   = 16,
     parameter WATCHDOG_BITS = 16
 ) (
+    // Clock and Reset
     input  wire                  clk,
     input  wire                  rst_n,
+
+    // ADC Interface (from analog front-end)
     input  wire [ADC_BITS-1:0]   adc_data,
     input  wire                  adc_valid,
+
+    // Event Detection Interface
     input  wire                  wake,
+
+    // Command Output Interface
     output wire [CMD_WIDTH-1:0]  cmd_out,
     output wire                  cmd_valid,
+
+    // LSK Modulator Interface
     output wire                  lsk_ctrl,
     output wire                  lsk_tx,
+
+    // Power Gating Control
     output wire                  pwr_gate_ctrl,
+
+    // Status Outputs
     output wire                  lms_busy,
     output wire                  dwt_busy,
     output wire                  cordic_busy,
@@ -71,8 +84,8 @@ module neurocore_field_sensor #(
     // ========================================================================
     // Internal Signals
     // ========================================================================
-    wire [FIR_WIDTH-1:0]     fir_out;
-    wire                     fir_valid;
+    wire [LMS_WIDTH-1:0]     lms_out;
+    wire                     lms_valid;
 
     wire [DWT_WIDTH-1:0]     dwt_out_0, dwt_out_1, dwt_out_2, dwt_out_3;
     wire [DWT_WIDTH-1:0]     dwt_out_4, dwt_out_5, dwt_out_6, dwt_out_7;
@@ -85,6 +98,7 @@ module neurocore_field_sensor #(
     wire [POWER_WIDTH-1:0]   power_bins_0, power_bins_1, power_bins_2, power_bins_3;
     wire [POWER_WIDTH-1:0]   power_bins_4, power_bins_5, power_bins_6, power_bins_7;
     wire                     acc_valid;
+    wire                     acc_busy_int;
 
     wire [CMD_WIDTH-1:0]     cmd_encoded;
     wire                     cmd_ready;
@@ -107,7 +121,7 @@ module neurocore_field_sensor #(
     localparam S_SLEEP       = 4'd9;
 
     // Control registers
-    reg                         fir_start_reg;
+    reg                         lms_start_reg;
     reg                         sample_pending;
     reg                         lsk_start_pulse;
     reg [WATCHDOG_BITS-1:0]     watchdog;
@@ -149,6 +163,9 @@ module neurocore_field_sensor #(
                 else if (watchdog[WATCHDOG_BITS-1])
                     next_state = S_SLEEP;
             end
+            S_ACCUM: begin
+                next_state = S_WAIT_ACCUM;
+            end
             S_WAIT_ACCUM: begin
                 if (acc_valid)
                     next_state = S_ENCODE;
@@ -158,6 +175,8 @@ module neurocore_field_sensor #(
             S_ENCODE: begin
                 if (cmd_ready)
                     next_state = S_LSK_TX;
+                else if (watchdog[WATCHDOG_BITS-1])
+                    next_state = S_SLEEP;
             end
             S_LSK_TX: begin
                 if (!lsk_tx)
@@ -178,11 +197,11 @@ module neurocore_field_sensor #(
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             watchdog        <= {WATCHDOG_BITS{1'b0}};
-            fir_start_reg   <= 1'b0;
+            lms_start_reg   <= 1'b0;
             sample_pending  <= 1'b0;
             lsk_start_pulse <= 1'b0;
         end else begin
-            fir_start_reg   <= 1'b0;
+            lms_start_reg   <= 1'b0;
             lsk_start_pulse <= 1'b0;
 
             // Watchdog
@@ -202,11 +221,11 @@ module neurocore_field_sensor #(
                 sample_pending <= 1'b0;
 
             if (state == S_COLLECT) begin
-                if (adc_valid_sync && !sample_pending && !fir_busy) begin
-                    fir_start_reg  <= 1'b1;
+                if (adc_valid_sync && !sample_pending && !lms_busy) begin
+                    lms_start_reg  <= 1'b1;
                     sample_pending <= 1'b1;
                 end
-                if (fir_valid)
+                if (lms_valid)
                     sample_pending <= 1'b0;
             end
 
@@ -217,28 +236,31 @@ module neurocore_field_sensor #(
     end
 
     // Control signal assignments
-    wire dwt_start     = (state == S_WAKE);
-    wire dwt_data_valid = fir_valid && (state == S_COLLECT);
-    wire mag_start     = (state == S_MAG);
-    wire acc_start     = (state == S_ACCUM);
+    wire dwt_start      = (state == S_WAKE);
+    wire dwt_data_valid = lms_valid && (state == S_COLLECT);
+    wire mag_start      = (state == S_MAG);
+    wire acc_start      = (state == S_ACCUM);
 
     assign pwr_gate_ctrl = (state != S_IDLE) && (state != S_SLEEP);
     assign processing    = (state != S_IDLE) && (state != S_SLEEP);
 
+    // cordic_busy mapped to accumulator busy (CORDIC removed, reuse pin)
+    assign cordic_busy = acc_busy_int;
+
     // ========================================================================
-    // FIR Artifact Filter
+    // LMS / FIR Artifact Filter (8-tap, fixed shift-add coefficients)
     // ========================================================================
-    fir_filter #(
-        .TAPS(FIR_TAPS),
-        .WIDTH(FIR_WIDTH)
-    ) u_fir_filter (
+    lms_filter #(
+        .TAPS(LMS_TAPS),
+        .WIDTH(LMS_WIDTH)
+    ) u_lms_filter (
         .clk(clk),
         .rst_n(rst_n),
-        .data_in({{(FIR_WIDTH-ADC_BITS){1'b0}}, adc_data}),
-        .start(fir_start_reg),
-        .data_out(fir_out),
-        .out_valid(fir_valid),
-        .busy(fir_busy)
+        .data_in({{(LMS_WIDTH-ADC_BITS){1'b0}}, adc_data}),
+        .start(lms_start_reg),
+        .data_out(lms_out),
+        .out_valid(lms_valid),
+        .busy(lms_busy)
     );
 
     // ========================================================================
@@ -250,7 +272,7 @@ module neurocore_field_sensor #(
     ) u_dwt_engine (
         .clk(clk),
         .rst_n(rst_n),
-        .data_in({{(DWT_WIDTH-FIR_WIDTH){fir_out[FIR_WIDTH-1]}}, fir_out}),
+        .data_in({{(DWT_WIDTH-LMS_WIDTH){lms_out[LMS_WIDTH-1]}}, lms_out}),
         .data_valid(dwt_data_valid),
         .start(dwt_start),
         .subband_0(dwt_out_0),
@@ -321,7 +343,7 @@ module neurocore_field_sensor #(
         .bin_6(power_bins_6),
         .bin_7(power_bins_7),
         .out_valid(acc_valid),
-        .busy(acc_busy)
+        .busy(acc_busy_int)
     );
 
     // ========================================================================
@@ -368,13 +390,16 @@ endmodule
 
 
 // ============================================================================
-// FIR Artifact Filter (8-tap, fixed shift-add coefficients)
+// LMS / FIR Artifact Filter (8-tap, fixed shift-add coefficients)
 // ============================================================================
 // Coefficients (symmetric, sum to 1.0):
 //   [0.25, 0.125, 0.0625, 0.0625, 0.0625, 0.0625, 0.125, 0.25]
 //   Implemented as right-shifts: [2, 3, 4, 4, 4, 4, 3, 2]
+//
+// Module name kept as lms_filter for port compatibility.
+// This is a fixed FIR filter (no adaptive weight update).
 // ============================================================================
-module fir_filter #(
+module lms_filter #(
     parameter TAPS  = 8,
     parameter WIDTH = 8
 ) (
@@ -391,12 +416,9 @@ module fir_filter #(
     reg [2:0]       tap_count;
     reg             processing;
 
-    // Accumulator with extra bits to prevent overflow
-    // Max accumulation: 8 terms of WIDTH-bit values shifted right by at least 2
-    // Worst case sum ~ 1.0 * max_value, so WIDTH+1 bits is sufficient
     reg signed [WIDTH+2:0] accum;
 
-    // Sign-extended and shifted tap value (computed combinationally for clarity)
+    // Sign-extended and shifted tap value
     reg signed [WIDTH+2:0] tap_contribution;
 
     integer i;
@@ -404,17 +426,16 @@ module fir_filter #(
     assign busy = processing;
 
     always @(*) begin
-        // Default
         tap_contribution = {(WIDTH+3){1'b0}};
         case (tap_count)
-            3'd0: tap_contribution = {{3{delay_line[0][WIDTH-1]}}, delay_line[0]} >>> 2;
-            3'd1: tap_contribution = {{3{delay_line[1][WIDTH-1]}}, delay_line[1]} >>> 3;
-            3'd2: tap_contribution = {{3{delay_line[2][WIDTH-1]}}, delay_line[2]} >>> 4;
-            3'd3: tap_contribution = {{3{delay_line[3][WIDTH-1]}}, delay_line[3]} >>> 4;
-            3'd4: tap_contribution = {{3{delay_line[4][WIDTH-1]}}, delay_line[4]} >>> 4;
-            3'd5: tap_contribution = {{3{delay_line[5][WIDTH-1]}}, delay_line[5]} >>> 4;
-            3'd6: tap_contribution = {{3{delay_line[6][WIDTH-1]}}, delay_line[6]} >>> 3;
-            3'd7: tap_contribution = {{3{delay_line[7][WIDTH-1]}}, delay_line[7]} >>> 2;
+            3'd0: tap_contribution = ({{3{delay_line[0][WIDTH-1]}}, delay_line[0]} >>> 2);
+            3'd1: tap_contribution = ({{3{delay_line[1][WIDTH-1]}}, delay_line[1]} >>> 3);
+            3'd2: tap_contribution = ({{3{delay_line[2][WIDTH-1]}}, delay_line[2]} >>> 4);
+            3'd3: tap_contribution = ({{3{delay_line[3][WIDTH-1]}}, delay_line[3]} >>> 4);
+            3'd4: tap_contribution = ({{3{delay_line[4][WIDTH-1]}}, delay_line[4]} >>> 4);
+            3'd5: tap_contribution = ({{3{delay_line[5][WIDTH-1]}}, delay_line[5]} >>> 4);
+            3'd6: tap_contribution = ({{3{delay_line[6][WIDTH-1]}}, delay_line[6]} >>> 3);
+            3'd7: tap_contribution = ({{3{delay_line[7][WIDTH-1]}}, delay_line[7]} >>> 2);
             default: tap_contribution = {(WIDTH+3){1'b0}};
         endcase
     end
@@ -432,7 +453,6 @@ module fir_filter #(
             out_valid <= 1'b0;
 
             if (start && !processing) begin
-                // Shift in new data
                 delay_line[0] <= data_in;
                 for (i = 1; i < TAPS; i = i + 1)
                     delay_line[i] <= delay_line[i-1];
@@ -465,8 +485,8 @@ endmodule
 // Collects 8 input samples, then performs 3-level in-place Haar lifting.
 //
 // Haar lifting per level (operating on pairs):
-//   detail  = even_sample - odd_sample
-//   approx  = (even_sample + odd_sample) >>> 1
+//   approx = (even_sample + odd_sample) >>> 1
+//   detail = even_sample - odd_sample
 //
 // Output mapping:
 //   subband_0 = cA3       (DC / lowest frequency)
@@ -482,11 +502,11 @@ module dwt_engine #(
     parameter LEVELS = 3,
     parameter WIDTH  = 12
 ) (
-    input  wire                 clk,
-    input  wire                 rst_n,
+    input  wire                    clk,
+    input  wire                    rst_n,
     input  wire signed [WIDTH-1:0] data_in,
-    input  wire                 data_valid,
-    input  wire                 start,
+    input  wire                    data_valid,
+    input  wire                    start,
     output reg  signed [WIDTH-1:0] subband_0,
     output reg  signed [WIDTH-1:0] subband_1,
     output reg  signed [WIDTH-1:0] subband_2,
@@ -495,20 +515,17 @@ module dwt_engine #(
     output reg  signed [WIDTH-1:0] subband_5,
     output reg  signed [WIDTH-1:0] subband_6,
     output reg  signed [WIDTH-1:0] subband_7,
-    output reg                  out_valid,
-    output wire                 busy
+    output reg                     out_valid,
+    output wire                    busy
 );
 
     localparam NUM_SAMPLES = 8;
 
-    // Working registers
     reg signed [WIDTH-1:0] w [0:NUM_SAMPLES-1];
-
-    // Snapshot registers to avoid read-before-write hazards
     reg signed [WIDTH-1:0] s [0:NUM_SAMPLES-1];
 
     reg [2:0] sample_cnt;
-    reg [2:0] proc_level;
+    reg [2:0] proc_level;  // 3 bits: needs to count 0-6
     reg       collecting;
     reg       proc_active;
 
@@ -522,7 +539,7 @@ module dwt_engine #(
             proc_active <= 1'b0;
             out_valid   <= 1'b0;
             sample_cnt  <= 3'd0;
-            proc_level  <= 2'd0;
+            proc_level  <= 3'd0;
             subband_0   <= {WIDTH{1'b0}};
             subband_1   <= {WIDTH{1'b0}};
             subband_2   <= {WIDTH{1'b0}};
@@ -538,80 +555,75 @@ module dwt_engine #(
         end else begin
             out_valid <= 1'b0;
 
-            // ---- Phase 1: Arm collection ----
+            // Phase 1: Arm collection
             if (start && !collecting && !proc_active) begin
                 collecting <= 1'b1;
                 sample_cnt <= 3'd0;
             end
 
-            // ---- Phase 2: Collect 8 samples ----
+            // Phase 2: Collect 8 samples
             if (collecting && data_valid) begin
                 w[sample_cnt] <= data_in;
                 if (sample_cnt == 3'd7) begin
                     collecting  <= 1'b0;
                     proc_active <= 1'b1;
-                    proc_level  <= 2'd0;
+                    proc_level  <= 3'd0;
                 end else begin
                     sample_cnt <= sample_cnt + 3'd1;
                 end
             end
 
-            // ---- Phase 3: Haar lifting (snapshot-based) ----
+            // Phase 3: Haar lifting with snapshot pattern
             if (proc_active) begin
                 case (proc_level)
-                    2'd0: begin
-                        // Snapshot current values
+                    3'd0: begin
+                        // Snapshot all 8 values
                         for (i = 0; i < NUM_SAMPLES; i = i + 1)
                             s[i] <= w[i];
-                        proc_level <= 2'd1;
+                        proc_level <= 3'd1;
                     end
-                    2'd1: begin
-                        // Level 1: 8 -> 4 approx + 4 detail
-                        // Uses snapshot s[] so no hazards
-                        w[0] <= (s[0] + s[1]) >>> 1;  // approx
+                    3'd1: begin
+                        // Level 1: 8 samples -> 4 approx + 4 detail
+                        w[0] <= (s[0] + s[1]) >>> 1;
                         w[1] <= (s[2] + s[3]) >>> 1;
                         w[2] <= (s[4] + s[5]) >>> 1;
                         w[3] <= (s[6] + s[7]) >>> 1;
-                        w[4] <= s[0] - s[1];           // detail (cD1)
+                        w[4] <= s[0] - s[1];
                         w[5] <= s[2] - s[3];
                         w[6] <= s[4] - s[5];
                         w[7] <= s[6] - s[7];
-                        proc_level <= 2'd2;
+                        proc_level <= 3'd2;
                     end
-                    2'd2: begin
-                        // Level 2: 4 approx -> 2 approx + 2 detail
-                        // w[0..3] hold level-1 approximations
-                        // Snapshot not needed: we only read w[0..3], write w[0..3]
-                        // But use s[] for safety
+                    3'd2: begin
+                        // Snapshot w[0..3] for level 2
                         s[0] <= w[0];
                         s[1] <= w[1];
                         s[2] <= w[2];
                         s[3] <= w[3];
-                        proc_level <= 2'd3;
+                        proc_level <= 3'd3;
                     end
-                    2'd3: begin
-                        // Apply level 2 from snapshot
+                    3'd3: begin
+                        // Level 2: 4 approx -> 2 approx + 2 detail
                         w[0] <= (s[0] + s[1]) >>> 1;
                         w[1] <= (s[2] + s[3]) >>> 1;
-                        w[2] <= s[0] - s[1];           // cD2[0]
-                        w[3] <= s[2] - s[3];           // cD2[1]
-                        proc_level <= 2'd4;
+                        w[2] <= s[0] - s[1];
+                        w[3] <= s[2] - s[3];
+                        proc_level <= 3'd4;
                     end
-                    2'd4: begin
-                        // Level 3: 2 approx -> 1 approx + 1 detail
-                        // Snapshot w[0], w[1]
+                    3'd4: begin
+                        // Snapshot w[0..1] for level 3
                         s[0] <= w[0];
                         s[1] <= w[1];
-                        proc_level <= 2'd5;
+                        proc_level <= 3'd5;
                     end
-                    2'd5: begin
-                        // Apply level 3 from snapshot
-                        w[0] <= (s[0] + s[1]) >>> 1;   // cA3
-                        w[1] <= s[0] - s[1];            // cD3
-                        proc_level <= 2'd6;
+                    3'd5: begin
+                        // Level 3: 2 approx -> 1 approx + 1 detail
+                        w[0] <= (s[0] + s[1]) >>> 1;
+                        w[1] <= s[0] - s[1];
+                        proc_level <= 3'd6;
                     end
-                    default: begin
-                        // 2'd6 and above: Output results
+                    3'd6: begin
+                        // Output results
                         subband_0 <= w[0];  // cA3
                         subband_1 <= w[1];  // cD3
                         subband_2 <= w[2];  // cD2[0]
@@ -622,6 +634,9 @@ module dwt_engine #(
                         subband_7 <= w[7];  // cD1[3]
                         proc_active <= 1'b0;
                         out_valid   <= 1'b1;
+                    end
+                    default: begin
+                        proc_active <= 1'b0;
                     end
                 endcase
             end
@@ -713,7 +728,6 @@ module power_accumulator #(
 
     wire [2*IN_WIDTH-1:0] squared = current_mag * current_mag;
 
-    // Truncation: take upper OUT_WIDTH bits if result is wider
     wire [OUT_WIDTH-1:0] squared_out;
     generate
         if (2*IN_WIDTH > OUT_WIDTH)
@@ -746,7 +760,6 @@ module power_accumulator #(
                 bin_idx     <= 3'd0;
                 current_mag <= mag_in_0;
             end else if (processing) begin
-                // Store squared result
                 case (bin_idx)
                     3'd0: bin_0 <= squared_out;
                     3'd1: bin_1 <= squared_out;
@@ -805,7 +818,6 @@ module command_encoder #(
     reg [3:0]           scan_idx;
     reg                 scanning;
 
-    // Mux to select current bin
     reg [BIN_WIDTH-1:0] current_bin;
     always @(*) begin
         case (scan_idx)
@@ -844,7 +856,6 @@ module command_encoder #(
                     end
                     scan_idx <= scan_idx + 4'd1;
                 end else begin
-                    // scan_idx == 8: latch final result
                     cmd_out   <= max_idx;
                     cmd_ready <= 1'b1;
                     scanning  <= 1'b0;
@@ -915,13 +926,11 @@ module lsk_modulator #(
             if (transmitting) begin
                 bit_timer <= bit_timer + {{(TIMER_W-1){1'b0}}, 1'b1};
 
-                // Manchester encoding
                 if (bit_timer < HALF_PERIOD[TIMER_W-1:0])
                     lsk_ctrl <= packet_reg[bit_count];
                 else
                     lsk_ctrl <= ~packet_reg[bit_count];
 
-                // End of bit period
                 if (bit_timer == BIT_PERIOD[TIMER_W-1:0] - {{(TIMER_W-1){1'b0}}, 1'b1}) begin
                     bit_timer <= {TIMER_W{1'b0}};
                     if (bit_count == 4'd0) begin
