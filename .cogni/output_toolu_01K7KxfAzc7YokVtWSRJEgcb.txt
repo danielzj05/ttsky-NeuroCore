@@ -1,0 +1,14 @@
+=== Command: git add src/neurocore_field_sensor.v (2026-02-20T03:37:06.304Z) ===
+Exit Code: 0
+Output:
+. : File C:\Users\danie\Documents\WindowsPowerShell\profile.ps1 cannot be loaded because running scripts is disabled 
+on this system. For more information, see about_Execution_Policies at https:/go.microsoft.com/fwlink/?LinkID=135170.
+At line:1 char:3
++ . 'C:\Users\danie\Documents\WindowsPowerShell\profile.ps1'
++   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : SecurityError: (:) [], PSSecurityException
+    + FullyQualifiedErrorId : UnauthorizedAccess
+warning: in the working copy of 'src/neurocore_field_sensor.v', LF will be replaced by CRLF the next time Git touches it
+
+=== End Output ===
+

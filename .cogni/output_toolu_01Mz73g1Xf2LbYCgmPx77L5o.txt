@@ -1,0 +1,16 @@
+=== Command: git commit -m "Remove duplicate neurocore_blocks.v to fix module conflicts" (2026-02-20T03:43:56.576Z) ===
+Exit Code: 0
+Output:
+. : File C:\Users\danie\Documents\WindowsPowerShell\profile.ps1 cannot be loaded because running scripts is disabled 
+on this system. For more information, see about_Execution_Policies at https:/go.microsoft.com/fwlink/?LinkID=135170.
+At line:1 char:3
++ . 'C:\Users\danie\Documents\WindowsPowerShell\profile.ps1'
++   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : SecurityError: (:) [], PSSecurityException
+    + FullyQualifiedErrorId : UnauthorizedAccess
+[main 82f7af7] Remove duplicate neurocore_blocks.v to fix module conflicts
+ 2 files changed, 50 insertions(+), 1222 deletions(-)
+ delete mode 100644 src/neurocore_blocks.v
+
+=== End Output ===
+

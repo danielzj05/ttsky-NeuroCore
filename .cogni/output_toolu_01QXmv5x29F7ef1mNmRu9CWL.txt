@@ -1,0 +1,15 @@
+=== Command: git push (2026-02-20T05:00:29.314Z) ===
+Exit Code: 0
+Output:
+. : File C:\Users\danie\Documents\WindowsPowerShell\profile.ps1 cannot be loaded because running scripts is disabled 
+on this system. For more information, see about_Execution_Policies at https:/go.microsoft.com/fwlink/?LinkID=135170.
+At line:1 char:3
++ . 'C:\Users\danie\Documents\WindowsPowerShell\profile.ps1'
++   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : SecurityError: (:) [], PSSecurityException
+    + FullyQualifiedErrorId : UnauthorizedAccess
+To https://github.com/danielzj05/ttsky-NeuroCore.git
+   5c4e25c..bf720f4  main -> main
+
+=== End Output ===
+

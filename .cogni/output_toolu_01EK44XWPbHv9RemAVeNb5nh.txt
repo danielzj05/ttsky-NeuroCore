@@ -1,0 +1,24 @@
+=== Command: git add info.yaml && git commit -m "Increase to 3x2 tiles (6x area) to fit NeuroCore design" && git push (2026-02-20T04:59:43.528Z) ===
+Exit Code: 1
+Output:
+. : File C:\Users\danie\Documents\WindowsPowerShell\profile.ps1 cannot be loaded because running scripts is disabled 
+on this system. For more information, see about_Execution_Policies at https:/go.microsoft.com/fwlink/?LinkID=135170.
+At line:1 char:3
++ . 'C:\Users\danie\Documents\WindowsPowerShell\profile.ps1'
++   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : SecurityError: (:) [], PSSecurityException
+    + FullyQualifiedErrorId : UnauthorizedAccess
+At line:1 char:19
++ git add info.yaml && git commit -m "Increase to 3x2 tiles (6x area) t ...
++                   ~~
+The token '&&' is not a valid statement separator in this version.
+At line:1 char:94
++ ...  "Increase to 3x2 tiles (6x area) to fit NeuroCore design" && git pus ...
++                                                                ~~
+The token '&&' is not a valid statement separator in this version.
+    + CategoryInfo          : ParserError: (:) [], ParentContainsErrorRecordException
+    + FullyQualifiedErrorId : InvalidEndOfLine
+ 
+
+=== End Output ===
+
