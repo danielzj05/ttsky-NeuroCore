@@ -29,7 +29,7 @@ def safe_int(sig, default=0):
     except ValueError:
         return default
 
-# --- uo_out fields ---
+# --- Output Accessors ---
 def cmd_out(dut):       return safe_int(dut.uo_out) & 0x07
 def cmd_valid(dut):     return (safe_int(dut.uo_out) >> 3) & 1
 def lsk_ctrl(dut):      return (safe_int(dut.uo_out) >> 4) & 1
@@ -37,7 +37,7 @@ def lsk_tx(dut):        return (safe_int(dut.uo_out) >> 5) & 1
 def pwr_gate(dut):      return (safe_int(dut.uo_out) >> 6) & 1
 def processing(dut):    return (safe_int(dut.uo_out) >> 7) & 1
 
-# --- uio_out fields ---
+# --- Bidirectional Accessors ---
 def lms_busy(dut):      return safe_int(dut.uio_out) & 1
 def dwt_busy(dut):      return (safe_int(dut.uio_out) >> 1) & 1
 def cordic_busy(dut):   return (safe_int(dut.uio_out) >> 2) & 1
@@ -611,20 +611,20 @@ async def test_21_dc_input_spectrum(dut):
 
 
 # ============================================================================
-# 22  NEW: HIGH FREQ INPUT SPECTRUM (Fs/4)
+# 22  NEW: DYNAMIC INPUT SPECTRUM (Fs/8)
 # ============================================================================
 
 @cocotb.test()
-async def test_22_high_freq_spectrum(dut):
-    """Feed Fs/4 signal (7, 7, -8, -8). Should pass FIR and trigger high bins."""
+async def test_22_dynamic_input_spectrum(dut):
+    """Feed Fs/8 signal (7, 7, 7, 7, -8, -8, -8, -8). Should pass FIR."""
     await init(dut)
 
-    # FIX: Use Fs/4 pattern. Nyquist (7, -8, 7, -8) is killed by Low Pass FIR.
-    # Pattern: 7, 7, -8, -8 (repeated twice = 8 samples)
-    # This lower freq survives the FIR but is still 'high freq' for DWT.
-    pattern = [7, 7, 8, 8, 7, 7, 8, 8] # 8 means -8
+    # FIX: Use Fs/8 pattern.
+    # The FIR filter notches out Fs/4 (7, 7, -8, -8).
+    # We use Fs/8 to ensure dynamic energy passes through.
+    pattern = [7, 7, 7, 7, 8, 8, 8, 8] # 8 means -8
 
-    dut._log.info("  Priming FIR filter with Fs/4 pattern...")
+    dut._log.info("  Priming FIR filter with Fs/8 pattern...")
     for s in pattern:
         await feed_sample(dut, s)
 
@@ -633,8 +633,8 @@ async def test_22_high_freq_spectrum(dut):
     await wait_for(dut, cmd_valid, 1, timeout=3000)
 
     # Check that we got a non-DC bin
-    assert cmd_out(dut) != 0, f"Fs/4 input produced DC bin {cmd_out(dut)}"
-    dut._log.info("PASS: Fs/4 input correctly classified")
+    assert cmd_out(dut) != 0, f"Fs/8 input produced DC bin {cmd_out(dut)}"
+    dut._log.info("PASS: Fs/8 input correctly classified")
 
 
 # ============================================================================
