@@ -6,7 +6,7 @@ SIM ?= icarus
 FST ?= -fst # Use more efficient FST format
 TOPLEVEL_LANG ?= verilog
 SRC_DIR = $(PWD)/../src
-PROJECT_SOURCES = project.v neurocore_field_sensor.v
+PROJECT_SOURCES = neurocore_field_sensor.v project.v
 
 ifneq ($(GATES),yes)
 
@@ -28,6 +28,9 @@ VERILOG_SOURCES += $(PDK_ROOT)/sky130A/libs.ref/sky130_fd_sc_hd/verilog/sky130_f
 
 # this gets copied in by the GDS action workflow
 VERILOG_SOURCES += $(PWD)/gate_level_netlist.v
+
+# Pass GATES to Python so test.py can detect GL mode
+export GATES
 
 endif
 

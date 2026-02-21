@@ -32,29 +32,16 @@ module neurocore_field_sensor #(
     parameter POWER_WIDTH   = 16,
     parameter WATCHDOG_BITS = 16
 ) (
-    // Clock and Reset
     input  wire                  clk,
     input  wire                  rst_n,
-
-    // ADC Interface (from analog front-end)
     input  wire [ADC_BITS-1:0]   adc_data,
     input  wire                  adc_valid,
-
-    // Event Detection Interface
     input  wire                  wake,
-
-    // Command Output Interface
     output wire [CMD_WIDTH-1:0]  cmd_out,
     output wire                  cmd_valid,
-
-    // LSK Modulator Interface
     output wire                  lsk_ctrl,
     output wire                  lsk_tx,
-
-    // Power Gating Control
     output wire                  pwr_gate_ctrl,
-
-    // Status Outputs
     output wire                  lms_busy,
     output wire                  dwt_busy,
     output wire                  cordic_busy,
@@ -84,24 +71,24 @@ module neurocore_field_sensor #(
     // ========================================================================
     // Internal Signals
     // ========================================================================
-    wire [LMS_WIDTH-1:0]     lms_out;
-    wire                     lms_valid;
+    wire [LMS_WIDTH-1:0]        lms_out;
+    wire                        lms_valid;
 
-    wire [DWT_WIDTH-1:0]     dwt_out_0, dwt_out_1, dwt_out_2, dwt_out_3;
-    wire [DWT_WIDTH-1:0]     dwt_out_4, dwt_out_5, dwt_out_6, dwt_out_7;
-    wire                     dwt_valid;
+    wire signed [DWT_WIDTH-1:0] dwt_out_0, dwt_out_1, dwt_out_2, dwt_out_3;
+    wire signed [DWT_WIDTH-1:0] dwt_out_4, dwt_out_5, dwt_out_6, dwt_out_7;
+    wire                        dwt_valid;
 
-    wire [MAG_WIDTH-1:0]     mag_0, mag_1, mag_2, mag_3;
-    wire [MAG_WIDTH-1:0]     mag_4, mag_5, mag_6, mag_7;
-    wire                     mag_valid;
+    wire [MAG_WIDTH-1:0]        mag_0, mag_1, mag_2, mag_3;
+    wire [MAG_WIDTH-1:0]        mag_4, mag_5, mag_6, mag_7;
+    wire                        mag_valid;
 
-    wire [POWER_WIDTH-1:0]   power_bins_0, power_bins_1, power_bins_2, power_bins_3;
-    wire [POWER_WIDTH-1:0]   power_bins_4, power_bins_5, power_bins_6, power_bins_7;
-    wire                     acc_valid;
-    wire                     acc_busy_int;
+    wire [POWER_WIDTH-1:0]      power_bins_0, power_bins_1, power_bins_2, power_bins_3;
+    wire [POWER_WIDTH-1:0]      power_bins_4, power_bins_5, power_bins_6, power_bins_7;
+    wire                        acc_valid;
+    wire                        acc_busy_int;
 
-    wire [CMD_WIDTH-1:0]     cmd_encoded;
-    wire                     cmd_ready;
+    wire [CMD_WIDTH-1:0]        cmd_encoded;
+    wire                        cmd_ready;
 
     // ========================================================================
     // Main FSM
@@ -120,7 +107,6 @@ module neurocore_field_sensor #(
     localparam S_LSK_TX      = 4'd8;
     localparam S_SLEEP       = 4'd9;
 
-    // Control registers
     reg                         lms_start_reg;
     reg                         sample_pending;
     reg                         lsk_start_pulse;
@@ -243,12 +229,10 @@ module neurocore_field_sensor #(
 
     assign pwr_gate_ctrl = (state != S_IDLE) && (state != S_SLEEP);
     assign processing    = (state != S_IDLE) && (state != S_SLEEP);
-
-    // cordic_busy mapped to accumulator busy (CORDIC removed, reuse pin)
-    assign cordic_busy = acc_busy_int;
+    assign cordic_busy   = acc_busy_int;
 
     // ========================================================================
-    // LMS / FIR Artifact Filter (8-tap, fixed shift-add coefficients)
+    // LMS / FIR Artifact Filter
     // ========================================================================
     lms_filter #(
         .TAPS(LMS_TAPS),
@@ -418,44 +402,70 @@ module lms_filter #(
 
     reg signed [WIDTH+2:0] accum;
 
-    // Sign-extended and shifted tap value
-    reg signed [WIDTH+2:0] tap_contribution;
-
-    integer i;
-
-    assign busy = processing;
-
+    // Select current tap value via mux
+    reg [WIDTH-1:0] current_tap;
     always @(*) begin
-        tap_contribution = {(WIDTH+3){1'b0}};
         case (tap_count)
-            3'd0: tap_contribution = ({{3{delay_line[0][WIDTH-1]}}, delay_line[0]} >>> 2);
-            3'd1: tap_contribution = ({{3{delay_line[1][WIDTH-1]}}, delay_line[1]} >>> 3);
-            3'd2: tap_contribution = ({{3{delay_line[2][WIDTH-1]}}, delay_line[2]} >>> 4);
-            3'd3: tap_contribution = ({{3{delay_line[3][WIDTH-1]}}, delay_line[3]} >>> 4);
-            3'd4: tap_contribution = ({{3{delay_line[4][WIDTH-1]}}, delay_line[4]} >>> 4);
-            3'd5: tap_contribution = ({{3{delay_line[5][WIDTH-1]}}, delay_line[5]} >>> 4);
-            3'd6: tap_contribution = ({{3{delay_line[6][WIDTH-1]}}, delay_line[6]} >>> 3);
-            3'd7: tap_contribution = ({{3{delay_line[7][WIDTH-1]}}, delay_line[7]} >>> 2);
+            3'd0: current_tap = delay_line[0];
+            3'd1: current_tap = delay_line[1];
+            3'd2: current_tap = delay_line[2];
+            3'd3: current_tap = delay_line[3];
+            3'd4: current_tap = delay_line[4];
+            3'd5: current_tap = delay_line[5];
+            3'd6: current_tap = delay_line[6];
+            3'd7: current_tap = delay_line[7];
+            default: current_tap = {WIDTH{1'b0}};
+        endcase
+    end
+
+    // Sign-extend tap to WIDTH+3 bits as a proper signed wire
+    wire signed [WIDTH+2:0] tap_signed = {{3{current_tap[WIDTH-1]}}, current_tap};
+
+    // Compute contribution with arithmetic right shift on signed value
+    reg signed [WIDTH+2:0] tap_contribution;
+    always @(*) begin
+        case (tap_count)
+            3'd0: tap_contribution = tap_signed >>> 2;
+            3'd1: tap_contribution = tap_signed >>> 3;
+            3'd2: tap_contribution = tap_signed >>> 4;
+            3'd3: tap_contribution = tap_signed >>> 4;
+            3'd4: tap_contribution = tap_signed >>> 4;
+            3'd5: tap_contribution = tap_signed >>> 4;
+            3'd6: tap_contribution = tap_signed >>> 3;
+            3'd7: tap_contribution = tap_signed >>> 2;
             default: tap_contribution = {(WIDTH+3){1'b0}};
         endcase
     end
 
+    assign busy = processing;
+
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            tap_count  <= 3'd0;
-            processing <= 1'b0;
-            out_valid  <= 1'b0;
-            data_out   <= {WIDTH{1'b0}};
-            accum      <= {(WIDTH+3){1'b0}};
-            for (i = 0; i < TAPS; i = i + 1)
-                delay_line[i] <= {WIDTH{1'b0}};
+            tap_count     <= 3'd0;
+            processing    <= 1'b0;
+            out_valid     <= 1'b0;
+            data_out      <= {WIDTH{1'b0}};
+            accum         <= {(WIDTH+3){1'b0}};
+            delay_line[0] <= {WIDTH{1'b0}};
+            delay_line[1] <= {WIDTH{1'b0}};
+            delay_line[2] <= {WIDTH{1'b0}};
+            delay_line[3] <= {WIDTH{1'b0}};
+            delay_line[4] <= {WIDTH{1'b0}};
+            delay_line[5] <= {WIDTH{1'b0}};
+            delay_line[6] <= {WIDTH{1'b0}};
+            delay_line[7] <= {WIDTH{1'b0}};
         end else begin
             out_valid <= 1'b0;
 
             if (start && !processing) begin
                 delay_line[0] <= data_in;
-                for (i = 1; i < TAPS; i = i + 1)
-                    delay_line[i] <= delay_line[i-1];
+                delay_line[1] <= delay_line[0];
+                delay_line[2] <= delay_line[1];
+                delay_line[3] <= delay_line[2];
+                delay_line[4] <= delay_line[3];
+                delay_line[5] <= delay_line[4];
+                delay_line[6] <= delay_line[5];
+                delay_line[7] <= delay_line[6];
 
                 processing <= 1'b1;
                 tap_count  <= 3'd0;
@@ -525,11 +535,9 @@ module dwt_engine #(
     reg signed [WIDTH-1:0] s [0:NUM_SAMPLES-1];
 
     reg [2:0] sample_cnt;
-    reg [2:0] proc_level;  // 3 bits: needs to count 0-6
+    reg [2:0] proc_level;
     reg       collecting;
     reg       proc_active;
-
-    integer i;
 
     assign busy = collecting | proc_active;
 
@@ -548,10 +556,22 @@ module dwt_engine #(
             subband_5   <= {WIDTH{1'b0}};
             subband_6   <= {WIDTH{1'b0}};
             subband_7   <= {WIDTH{1'b0}};
-            for (i = 0; i < NUM_SAMPLES; i = i + 1) begin
-                w[i] <= {WIDTH{1'b0}};
-                s[i] <= {WIDTH{1'b0}};
-            end
+            w[0] <= {WIDTH{1'b0}};
+            w[1] <= {WIDTH{1'b0}};
+            w[2] <= {WIDTH{1'b0}};
+            w[3] <= {WIDTH{1'b0}};
+            w[4] <= {WIDTH{1'b0}};
+            w[5] <= {WIDTH{1'b0}};
+            w[6] <= {WIDTH{1'b0}};
+            w[7] <= {WIDTH{1'b0}};
+            s[0] <= {WIDTH{1'b0}};
+            s[1] <= {WIDTH{1'b0}};
+            s[2] <= {WIDTH{1'b0}};
+            s[3] <= {WIDTH{1'b0}};
+            s[4] <= {WIDTH{1'b0}};
+            s[5] <= {WIDTH{1'b0}};
+            s[6] <= {WIDTH{1'b0}};
+            s[7] <= {WIDTH{1'b0}};
         end else begin
             out_valid <= 1'b0;
 
@@ -578,8 +598,10 @@ module dwt_engine #(
                 case (proc_level)
                     3'd0: begin
                         // Snapshot all 8 values
-                        for (i = 0; i < NUM_SAMPLES; i = i + 1)
-                            s[i] <= w[i];
+                        s[0] <= w[0]; s[1] <= w[1];
+                        s[2] <= w[2]; s[3] <= w[3];
+                        s[4] <= w[4]; s[5] <= w[5];
+                        s[6] <= w[6]; s[7] <= w[7];
                         proc_level <= 3'd1;
                     end
                     3'd1: begin
@@ -596,10 +618,8 @@ module dwt_engine #(
                     end
                     3'd2: begin
                         // Snapshot w[0..3] for level 2
-                        s[0] <= w[0];
-                        s[1] <= w[1];
-                        s[2] <= w[2];
-                        s[3] <= w[3];
+                        s[0] <= w[0]; s[1] <= w[1];
+                        s[2] <= w[2]; s[3] <= w[3];
                         proc_level <= 3'd3;
                     end
                     3'd3: begin
@@ -612,8 +632,7 @@ module dwt_engine #(
                     end
                     3'd4: begin
                         // Snapshot w[0..1] for level 3
-                        s[0] <= w[0];
-                        s[1] <= w[1];
+                        s[0] <= w[0]; s[1] <= w[1];
                         proc_level <= 3'd5;
                     end
                     3'd5: begin
@@ -624,14 +643,14 @@ module dwt_engine #(
                     end
                     3'd6: begin
                         // Output results
-                        subband_0 <= w[0];  // cA3
-                        subband_1 <= w[1];  // cD3
-                        subband_2 <= w[2];  // cD2[0]
-                        subband_3 <= w[3];  // cD2[1]
-                        subband_4 <= w[4];  // cD1[0]
-                        subband_5 <= w[5];  // cD1[1]
-                        subband_6 <= w[6];  // cD1[2]
-                        subband_7 <= w[7];  // cD1[3]
+                        subband_0   <= w[0];  // cA3
+                        subband_1   <= w[1];  // cD3
+                        subband_2   <= w[2];  // cD2[0]
+                        subband_3   <= w[3];  // cD2[1]
+                        subband_4   <= w[4];  // cD1[0]
+                        subband_5   <= w[5];  // cD1[1]
+                        subband_6   <= w[6];  // cD1[2]
+                        subband_7   <= w[7];  // cD1[3]
                         proc_active <= 1'b0;
                         out_valid   <= 1'b1;
                     end
@@ -665,9 +684,12 @@ module magnitude_extract #(
     output reg                     out_valid
 );
 
-    function [WIDTH-1:0] abs_val;
+    // Verilator-safe absolute value function
+    function automatic [WIDTH-1:0] abs_val;
         input signed [WIDTH-1:0] val;
-        abs_val = val[WIDTH-1] ? (~val + {{(WIDTH-1){1'b0}}, 1'b1}) : val;
+        begin
+            abs_val = val[WIDTH-1] ? (~val + {{(WIDTH-1){1'b0}}, 1'b1}) : val;
+        end
     endfunction
 
     always @(posedge clk or negedge rst_n) begin
@@ -738,6 +760,21 @@ module power_accumulator #(
 
     assign busy = processing;
 
+    // Next magnitude mux (extracted for lint cleanliness)
+    reg [IN_WIDTH-1:0] next_mag;
+    always @(*) begin
+        case (bin_idx + 3'd1)
+            3'd1:    next_mag = mag_in_1;
+            3'd2:    next_mag = mag_in_2;
+            3'd3:    next_mag = mag_in_3;
+            3'd4:    next_mag = mag_in_4;
+            3'd5:    next_mag = mag_in_5;
+            3'd6:    next_mag = mag_in_6;
+            3'd7:    next_mag = mag_in_7;
+            default: next_mag = {IN_WIDTH{1'b0}};
+        endcase
+    end
+
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             bin_0       <= {OUT_WIDTH{1'b0}};
@@ -769,23 +806,15 @@ module power_accumulator #(
                     3'd5: bin_5 <= squared_out;
                     3'd6: bin_6 <= squared_out;
                     3'd7: bin_7 <= squared_out;
+                    default: ;
                 endcase
 
                 if (bin_idx == 3'd7) begin
                     processing <= 1'b0;
                     out_valid  <= 1'b1;
                 end else begin
-                    bin_idx <= bin_idx + 3'd1;
-                    case (bin_idx + 3'd1)
-                        3'd1: current_mag <= mag_in_1;
-                        3'd2: current_mag <= mag_in_2;
-                        3'd3: current_mag <= mag_in_3;
-                        3'd4: current_mag <= mag_in_4;
-                        3'd5: current_mag <= mag_in_5;
-                        3'd6: current_mag <= mag_in_6;
-                        3'd7: current_mag <= mag_in_7;
-                        default: current_mag <= {IN_WIDTH{1'b0}};
-                    endcase
+                    bin_idx     <= bin_idx + 3'd1;
+                    current_mag <= next_mag;
                 end
             end
         end
@@ -797,7 +826,7 @@ endmodule
 // ============================================================================
 // Command Encoder (Sequential Max-Finder)
 // ============================================================================
-// 9 cycles: 8 compare + 1 latch
+// 9 cycles: load bin_0 + compare bins 1-7 + latch result
 // ============================================================================
 module command_encoder #(
     parameter NUM_BINS  = 8,
@@ -872,6 +901,7 @@ endmodule
 // ============================================================================
 // Packet: [1010][1100][cmd2 cmd1 cmd0][parity][11]
 // Manchester: bit=1 -> HIGH then LOW; bit=0 -> LOW then HIGH
+// MSB transmitted first (bit_count 13 down to 0).
 // ============================================================================
 module lsk_modulator #(
     parameter CMD_WIDTH  = 3,
@@ -948,4 +978,4 @@ module lsk_modulator #(
 
 endmodule
 
-`default_nettype wire
+`default_nettype none
