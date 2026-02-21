@@ -424,20 +424,20 @@ async def test_06_dc_input(dut):
 # =============================================================================
 @cocotb.test()
 async def test_07_alternating_input(dut):
-    """Lower-frequency alternating pattern to survive FIR filtering."""
+    """Alternating +7/-8 should excite cD1 (bins 4-7) after sign extension fix."""
     await setup_dut(dut)
     
-    # Alternate every 2 samples — half the Nyquist frequency
-    # This pattern has energy in cD2 range and should survive the FIR better
-    samples = [15, 15, 0, 0, 15, 15, 0, 0]
+    # 7 = 0b0111, -8 = 0b1000 (4-bit two's complement)
+    samples = [7, 8, 7, 8, 7, 8, 7, 8]  # 8 = 0b1000 = -8 in signed 4-bit
     result = await run_full_pipeline(dut, samples)
     
-    dut._log.info(f"Alternating-2 [15,15,0,0]*2 -> cmd = {result['cmd']}")
-    # Just verify pipeline completes. Exact bin depends on FIR attenuation.
-    # If cmd != 0, it means detail coefficients are present.
+    dut._log.info(f"Alternating +7/-8 -> cmd = {result['cmd']}")
+    assert result['cmd'] >= 4, (
+        f"Alternating input should give cmd in cD1 range (4-7), got {result['cmd']}"
+    )
     
     await wait_for_sleep(dut)
-    dut._log.info(f"PASS: Alternating input processed, cmd={result['cmd']}")
+    dut._log.info("PASS: Alternating input -> high-frequency bin")
 
 
 # =============================================================================

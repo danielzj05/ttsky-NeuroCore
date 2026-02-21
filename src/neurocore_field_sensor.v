@@ -256,7 +256,7 @@ module neurocore_field_sensor #(
     ) u_lms_filter (
         .clk(clk),
         .rst_n(rst_n),
-        .data_in({{(LMS_WIDTH-ADC_BITS){1'b0}}, adc_data}),
+        .data_in({{(LMS_WIDTH-ADC_BITS){adc_data[ADC_BITS-1]}}, adc_data}),
         .start(lms_start_reg),
         .data_out(lms_out),
         .out_valid(lms_valid),
