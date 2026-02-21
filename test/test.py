@@ -101,11 +101,18 @@ async def wait_for(dut, fn, value, timeout=60000):
 
 
 async def run_pipeline(dut, timeout=60000):
-    """Trigger one full wake→…→sleep cycle.  Returns True if it finishes."""
+    """Trigger one full wake→…→sleep→idle cycle.  Returns True if it finishes."""
     await pulse_wake(dut)
     if not await wait_for(dut, pwr_gate, 1, timeout=20):
         return False
-    return await wait_for(dut, pwr_gate, 0, timeout=timeout)
+    if not await wait_for(dut, pwr_gate, 0, timeout=timeout):
+        return False
+    # Also wait for LSK modulator to fully deassert (can lag FSM by 1 cycle)
+    if not await wait_for(dut, lsk_tx, 0, timeout=200):
+        return False
+    # Let S_SLEEP → S_IDLE settle
+    await ClockCycles(dut.clk, 2)
+    return True
 
 
 # ============================================================================
@@ -360,14 +367,11 @@ async def test_12_consecutive_pipelines(dut):
             await feed_sample(dut, (s + n * 3) & 0xF)
         ok = await run_pipeline(dut)
         assert ok, f"Pipeline stuck on run {n}"
-        # Wait for LSK modulator to fully finish (tx_active can lag FSM by 1 clk)
-        ok = await wait_for(dut, lsk_tx, 0, timeout=100)
-        assert ok, f"Run {n}: lsk_tx never de-asserted"
-        await ClockCycles(dut.clk, 2)
-        # Verify clean return to idle
+        # run_pipeline already waits for pwr_gate=0, lsk_tx=0, plus settle
         assert pwr_gate(dut) == 0, f"Run {n}: pwr_gate not 0"
         assert lms_busy(dut) == 0, f"Run {n}: lms_busy not 0"
         assert dwt_busy(dut) == 0, f"Run {n}: dwt_busy not 0"
+        assert lsk_tx(dut) == 0,   f"Run {n}: lsk_tx not 0"
         dut._log.info(f"  Run {n}: OK")
 
     dut._log.info("PASS: 3 consecutive pipelines completed")
