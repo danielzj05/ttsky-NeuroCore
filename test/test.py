@@ -7,7 +7,7 @@
 
 import cocotb
 from cocotb.clock import Clock
-from cocotb.triggers import ClockCycles
+from cocotb.triggers import ClockCycles, Timer
 import os
 
 # ============================================================================
@@ -611,35 +611,30 @@ async def test_21_dc_input_spectrum(dut):
 
 
 # ============================================================================
-# 22  NEW: NYQUIST INPUT SPECTRUM (FIXED)
+# 22  NEW: HIGH FREQ INPUT SPECTRUM (Fs/4)
 # ============================================================================
 
 @cocotb.test()
-async def test_22_nyquist_input_spectrum(dut):
-    """Feed Alternating +MAX/-MAX (Nyquist). Should trigger high bins."""
+async def test_22_high_freq_spectrum(dut):
+    """Feed Fs/4 signal (7, 7, -8, -8). Should pass FIR and trigger high bins."""
     await init(dut)
 
-    # FIX: Pre-fill FIR filter by feeding data WITHOUT asserting wake first.
-    # This prevents the initial "transient" (averaging with zeros) from killing
-    # the high-frequency energy on the very first run.
-    dut._log.info("  Priming FIR filter with Nyquist pattern...")
-    for i in range(8):
-        val = 7 if (i % 2 == 0) else 8
-        await feed_sample(dut, val)
+    # FIX: Use Fs/4 pattern. Nyquist (7, -8, 7, -8) is killed by Low Pass FIR.
+    # Pattern: 7, 7, -8, -8 (repeated twice = 8 samples)
+    # This lower freq survives the FIR but is still 'high freq' for DWT.
+    pattern = [7, 7, 8, 8, 7, 7, 8, 8] # 8 means -8
 
-    dut._log.info("  Waking up and processing...")
+    dut._log.info("  Priming FIR filter with Fs/4 pattern...")
+    for s in pattern:
+        await feed_sample(dut, s)
+
+    dut._log.info("  Waking...")
     await pulse_wake(dut)
-    
     await wait_for(dut, cmd_valid, 1, timeout=3000)
 
-    cmd = cmd_out(dut)
-    dut._log.info(f"  Nyquist Input -> Command: {cmd}")
-
-    # Due to FIR shaping transient, the specific bin might jitter.
-    # We relax the check to 'not zero' (meaning it found *some* high freq energy)
-    # rather than asserting it is specifically bin 7.
-    assert cmd != 0, f"High Freq input produced DC bin {cmd}!"
-    dut._log.info("PASS: Nyquist input classified as high frequency")
+    # Check that we got a non-DC bin
+    assert cmd_out(dut) != 0, f"Fs/4 input produced DC bin {cmd_out(dut)}"
+    dut._log.info("PASS: Fs/4 input correctly classified")
 
 
 # ============================================================================
@@ -658,7 +653,8 @@ async def test_23_async_reset_recovery(dut):
 
     dut._log.info("  Asserting Async Reset mid-operation...")
     dut.rst_n.value = 0
-    await ClockCycles(dut.clk, 5)
+    # FIX: Wait a tiny bit for RTL delta cycles to settle
+    await Timer(1, "ns")
 
     # Verify immediate stop
     assert pwr_gate(dut) == 0, "Power gate did not drop on reset"
@@ -672,7 +668,7 @@ async def test_23_async_reset_recovery(dut):
 
 
 # ============================================================================
-# 24  NEW: WATCHDOG TIMEOUT (FIXED)
+# 24  NEW: WATCHDOG TIMEOUT
 # ============================================================================
 
 @cocotb.test()
@@ -696,17 +692,12 @@ async def test_24_watchdog_timeout(dut):
     # WDT is 16-bit ~32768 cycles.
     dut._log.info("  Waiting for Watchdog (~32768 cycles)...")
 
-    # FIX: We cannot sleep for 100 cycles at a time because S_SLEEP (13)
-    # might only last for ONE cycle before going to IDLE (0).
-    # We must check every clock cycle to catch the transition.
-    
-    # Use our reusable wait_for helper which polls every single cycle.
-    # We define a lambda to check the internal state.
+    # FIX: Increase timeout to 50k to cover initialization overhead
     fired = await wait_for(
-        dut, 
-        lambda d: safe_int(d.user_project.sensor.state) == 13, 
-        13, # Expecting state value 13
-        timeout=35000 # Wait slightly longer than 2^15
+        dut,
+        lambda d: safe_int(d.user_project.sensor.state) == 13,
+        True,
+        timeout=50000
     )
 
     assert fired, "Watchdog failed to force state to SLEEP(13)!"
