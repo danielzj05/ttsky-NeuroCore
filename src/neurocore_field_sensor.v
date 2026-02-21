@@ -125,11 +125,13 @@ module neurocore_field_sensor #(
     localparam S_WAIT_ACCUM  = 4'd9;
     localparam S_ENCODE      = 4'd10;
     localparam S_LSK_TX      = 4'd11;
-    localparam S_SLEEP       = 4'd12;
+    localparam S_LSK_WAIT    = 4'd12;
+    localparam S_SLEEP       = 4'd13;
 
     // Watchdog: any WAIT state that exceeds 2^WDT_BITS cycles -> force IDLE
     wire in_wait_state = (state == S_WAIT_LMS)  || (state == S_WAIT_DWT) ||
-                         (state == S_WAIT_ABS)   || (state == S_WAIT_ACCUM);
+                         (state == S_WAIT_ABS)   || (state == S_WAIT_ACCUM) ||
+                         (state == S_LSK_WAIT);
     wire wdt_timeout   = in_wait_state && (&wdt_cnt);  // all-ones
 
     always @(posedge clk or negedge rst_n) begin
@@ -162,7 +164,8 @@ module neurocore_field_sensor #(
                 S_ACCUM:                      next_state = S_WAIT_ACCUM;
                 S_WAIT_ACCUM: if (acc_valid)  next_state = S_ENCODE;
                 S_ENCODE:     if (cmd_ready)  next_state = S_LSK_TX;
-                S_LSK_TX:     if (!lsk_tx)    next_state = S_SLEEP;
+                S_LSK_TX:                     next_state = S_LSK_WAIT;
+                S_LSK_WAIT:   if (!lsk_tx)    next_state = S_SLEEP;
                 S_SLEEP:                      next_state = S_IDLE;
                 default:                      next_state = S_IDLE;
             endcase
