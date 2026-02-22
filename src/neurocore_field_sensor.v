@@ -45,6 +45,9 @@ module neurocore_field_sensor #(
     // Event Detection
     input  wire                  wake,
 
+    // TMS Target Setting (encoded frequency bin the TMS should match)
+    input  wire [2:0]            target_idx,
+
     // Command Output
     output wire [CMD_WIDTH-1:0]  cmd_out,
     output wire                  cmd_valid,
@@ -285,13 +288,14 @@ module neurocore_field_sensor #(
     command_encoder #(
         .CMD_WIDTH(CMD_WIDTH)
     ) u_cmd_encoder (
-        .clk      (clk),
-        .rst_n    (rst_n),
+        .clk       (clk),
+        .rst_n     (rst_n),
         .bin_0(power_bins_0), .bin_1(power_bins_1), .bin_2(power_bins_2), .bin_3(power_bins_3),
         .bin_4(power_bins_4), .bin_5(power_bins_5), .bin_6(power_bins_6), .bin_7(power_bins_7),
-        .encode_en(state == S_ENCODE),
-        .cmd_out  (cmd_encoded),
-        .cmd_ready(cmd_ready)
+        .target_idx(target_idx),
+        .encode_en (state == S_ENCODE),
+        .cmd_out   (cmd_encoded),
+        .cmd_ready (cmd_ready)
     );
 
     // ========================================================================
@@ -595,7 +599,14 @@ module power_accumulator_ts #(
     end
 
     wire [2*IN_WIDTH-1:0] sq_full = cur_mag * cur_mag;
-    wire [OUT_WIDTH-1:0]  sq_trunc = sq_full[2*IN_WIDTH-1 : 2*IN_WIDTH-OUT_WIDTH];
+    // FIX: Use lower bits with saturation guard.  The old expression
+    //   sq_full[2*IN_WIDTH-1 : 2*IN_WIDTH-OUT_WIDTH]  (upper 16 of 24)
+    // yields 0 for the 4-bit ADC path (max sq ≈ 225 < 256, all in low byte).
+    // Taking the lower OUT_WIDTH bits preserves actual energy; the saturation
+    // guard caps at max if the value ever exceeds OUT_WIDTH bits (wider ADCs).
+    wire [OUT_WIDTH-1:0]  sq_trunc = (|sq_full[2*IN_WIDTH-1:OUT_WIDTH])
+                                       ? {OUT_WIDTH{1'b1}}
+                                       : sq_full[OUT_WIDTH-1:0];
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -635,7 +646,9 @@ endmodule
 
 
 // ============================================================================
-// Command Encoder (sequential scan)
+// Command Encoder (Closed-Loop Error Controller)
+// Scans power bins to find dominant distortion profile, compares against
+// target_idx (the encoded TMS setting), and issues proportional commands.
 // ============================================================================
 module command_encoder #(
     parameter CMD_WIDTH = 3
@@ -644,14 +657,25 @@ module command_encoder #(
     input  wire                 rst_n,
     input  wire [15:0]          bin_0, bin_1, bin_2, bin_3,
     input  wire [15:0]          bin_4, bin_5, bin_6, bin_7,
+    input  wire [2:0]           target_idx,  // The encoded setting the TMS *should* hit
     input  wire                 encode_en,
     output reg  [CMD_WIDTH-1:0] cmd_out,
     output reg                  cmd_ready
 );
+
     reg [15:0] max_bin;
     reg [2:0]  max_idx;
     reg [3:0]  scan_idx;
     reg        scanning;
+
+    // Command Dictionary (Mapped to external TMS trigger actions)
+    localparam CMD_HOLD      = 3'b000; // 0: On target, do nothing
+    localparam CMD_INC_1HZ   = 3'b001; // 1: Increase frequency slightly
+    localparam CMD_DEC_1HZ   = 3'b010; // 2: Decrease frequency slightly
+    localparam CMD_INC_FAST  = 3'b011; // 3: Increase frequency heavily
+    localparam CMD_DEC_FAST  = 3'b100; // 4: Decrease frequency heavily
+    localparam CMD_STOP      = 3'b111; // 7: Error/Safety stop
+
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             cmd_out   <= 0;
@@ -663,12 +687,14 @@ module command_encoder #(
         end else begin
             if (!encode_en)
                 cmd_ready <= 0;
+
             if (encode_en && !scanning && !cmd_ready) begin
                 max_bin  <= bin_0;
                 max_idx  <= 3'd0;
                 scan_idx <= 4'd1;
                 scanning <= 1;
             end else if (scanning) begin
+                // Step 1: Scan to find the current dominant profile
                 case (scan_idx)
                     4'd1: begin if (bin_1 > max_bin) begin max_bin <= bin_1; max_idx <= 3'd1; end end
                     4'd2: begin if (bin_2 > max_bin) begin max_bin <= bin_2; max_idx <= 3'd2; end end
@@ -680,8 +706,19 @@ module command_encoder #(
                     default: begin end
                 endcase
 
+                // Step 2: Compare to Target Setting and Map the Command
                 if (scan_idx == 4'd8) begin
-                    cmd_out   <= max_idx[CMD_WIDTH-1:0];
+                    if (max_idx == target_idx) begin
+                        // Perfect match
+                        cmd_out <= CMD_HOLD;
+                    end else if (max_idx > target_idx) begin
+                        // Current frequency is higher than target
+                        cmd_out <= (max_idx - target_idx > 2) ? CMD_DEC_FAST : CMD_DEC_1HZ;
+                    end else begin
+                        // Current frequency is lower than target
+                        cmd_out <= (target_idx - max_idx > 2) ? CMD_INC_FAST : CMD_INC_1HZ;
+                    end
+
                     cmd_ready <= 1;
                     scanning  <= 0;
                 end else begin

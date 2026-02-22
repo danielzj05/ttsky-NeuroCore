@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: Apache-2.0
 #
 # NeuroCore Field Sensor — cocotb testbench
-# Expanded Stress-Test Bench covering Protocol, Spectrum, and Watchdog
+# Expanded Stress-Test Bench covering Protocol, Spectrum, Watchdog,
+# and Closed-Loop TMS Error-Controller Commands
 #
 
 import cocotb
@@ -42,6 +43,14 @@ def lms_busy(dut):      return safe_int(dut.uio_out) & 1
 def dwt_busy(dut):      return (safe_int(dut.uio_out) >> 1) & 1
 def cordic_busy(dut):   return (safe_int(dut.uio_out) >> 2) & 1
 
+# --- Command Dictionary (must match Verilog localparams) ---
+CMD_HOLD     = 0  # On target
+CMD_INC_1HZ  = 1  # Increase frequency slightly  (error 1-2 bins)
+CMD_DEC_1HZ  = 2  # Decrease frequency slightly  (error 1-2 bins)
+CMD_INC_FAST = 3  # Increase frequency heavily   (error 3+ bins)
+CMD_DEC_FAST = 4  # Decrease frequency heavily   (error 3+ bins)
+CMD_STOP     = 7  # Safety stop (reserved)
+
 
 # ============================================================================
 # Reusable coroutines
@@ -58,6 +67,11 @@ async def init(dut, period_ns=20):
     await ClockCycles(dut.clk, 10)
     dut.rst_n.value = 1
     await ClockCycles(dut.clk, 2)
+
+
+def set_target_idx(dut, idx):
+    """Set the TMS target frequency bin (3 bits) on uio_in[5:3]."""
+    dut.uio_in.value = (idx & 0x7) << 3
 
 
 async def feed_sample(dut, data):
@@ -86,7 +100,7 @@ async def wait_for(dut, fn, value, timeout=60000):
 
 
 async def run_pipeline(dut, timeout=60000):
-    """Trigger one full wake→…→sleep→idle cycle. Returns True if it finishes."""
+    """Trigger one full wake->...->sleep->idle cycle. Returns True if it finishes."""
     await pulse_wake(dut)
     if not await wait_for(dut, pwr_gate, 1, timeout=20):
         return False
@@ -95,9 +109,27 @@ async def run_pipeline(dut, timeout=60000):
     # Wait for LSK modulator to finish transmission
     if not await wait_for(dut, lsk_tx, 0, timeout=4000):
         return False
-    # Let S_SLEEP → S_IDLE settle
+    # Let S_SLEEP -> S_IDLE settle
     await ClockCycles(dut.clk, 2)
     return True
+
+
+async def run_and_get_cmd(dut, timeout=60000):
+    """Run one pipeline cycle and return the command output. Returns (ok, cmd)."""
+    await pulse_wake(dut)
+    if not await wait_for(dut, pwr_gate, 1, timeout=20):
+        return (False, -1)
+    ok = await wait_for(dut, cmd_valid, 1, timeout=3000)
+    if not ok:
+        return (False, -1)
+    cmd = cmd_out(dut)
+    # Wait for pipeline to fully complete
+    if not await wait_for(dut, pwr_gate, 0, timeout=timeout):
+        return (False, cmd)
+    if not await wait_for(dut, lsk_tx, 0, timeout=4000):
+        return (False, cmd)
+    await ClockCycles(dut.clk, 2)
+    return (True, cmd)
 
 
 # ============================================================================
@@ -159,7 +191,7 @@ async def test_03_cordic_busy_always_zero(dut):
 
 @cocotb.test()
 async def test_04_sync_latency(dut):
-    """Wake signal passes through 2-FF sync — not seen for at least 2 cycles."""
+    """Wake signal passes through 2-FF sync -- not seen for at least 2 cycles."""
     await init(dut)
 
     dut.ui_in.value = build_ui(wake=1)
@@ -175,11 +207,11 @@ async def test_04_sync_latency(dut):
     assert ok, "FSM never left IDLE after wake sync"
 
     dut.ui_in.value = 0
-    dut._log.info("PASS: 2-FF sync verified (idle for ≥2 cycles, active within 5)")
+    dut._log.info("PASS: 2-FF sync verified (idle for >=2 cycles, active within 5)")
 
 
 # ============================================================================
-# 5  LMS FILTER — BUSY FLAG
+# 5  LMS FILTER -- BUSY FLAG
 # ============================================================================
 
 @cocotb.test()
@@ -203,7 +235,7 @@ async def test_05_lms_busy(dut):
 
 
 # ============================================================================
-# 6  DWT ENGINE — BUSY FLAG
+# 6  DWT ENGINE -- BUSY FLAG
 # ============================================================================
 
 @cocotb.test()
@@ -246,7 +278,7 @@ async def test_07_pwr_gate_lifecycle(dut):
 
 
 # ============================================================================
-# 8  LSK MODULATOR — MANCHESTER ENCODING (Basic Toggle)
+# 8  LSK MODULATOR -- MANCHESTER ENCODING (Basic Toggle)
 # ============================================================================
 
 @cocotb.test()
@@ -263,7 +295,7 @@ async def test_08_lsk_transmission(dut):
     assert ok, "lsk_tx never asserted"
     dut._log.info("  LSK transmission started")
 
-    # Count lsk_ctrl transitions during TX — Manchester must toggle
+    # Count lsk_ctrl transitions during TX -- Manchester must toggle
     transitions = 0
     prev_ctrl = lsk_ctrl(dut)
     for _ in range(4000):
@@ -277,18 +309,18 @@ async def test_08_lsk_transmission(dut):
 
     dut._log.info(f"  lsk_ctrl transitions: {transitions}")
     assert transitions >= 2, \
-        f"Expected ≥2 lsk_ctrl transitions (Manchester), got {transitions}"
+        f"Expected >=2 lsk_ctrl transitions (Manchester), got {transitions}"
     assert lsk_tx(dut) == 0, "lsk_tx should be 0 after TX"
     dut._log.info("PASS: LSK Manchester encoding observed")
 
 
 # ============================================================================
-# 9  COMMAND ENCODER — cmd_valid PULSE
+# 9  COMMAND ENCODER -- cmd_valid PULSE
 # ============================================================================
 
 @cocotb.test()
 async def test_09_cmd_valid_pulse(dut):
-    """cmd_valid must pulse during the pipeline; cmd_out in [0,7]."""
+    """cmd_valid must pulse during the pipeline; cmd_out in valid command set."""
     await init(dut)
 
     for s in [2, 4, 6, 7, 5, 3, 1, 0]:
@@ -301,12 +333,13 @@ async def test_09_cmd_valid_pulse(dut):
 
     cmd = cmd_out(dut)
     dut._log.info(f"  cmd_out = {cmd}")
-    assert 0 <= cmd <= 7, f"cmd_out out of range: {cmd}"
-    dut._log.info("PASS: cmd_valid pulsed, cmd_out in range")
+    valid_cmds = {CMD_HOLD, CMD_INC_1HZ, CMD_DEC_1HZ, CMD_INC_FAST, CMD_DEC_FAST, CMD_STOP}
+    assert cmd in valid_cmds, f"cmd_out {cmd} not in valid command set"
+    dut._log.info("PASS: cmd_valid pulsed, cmd_out is a valid command")
 
 
 # ============================================================================
-# 10  FULL PIPELINE — ZERO DATA
+# 10  FULL PIPELINE -- ZERO DATA
 # ============================================================================
 
 @cocotb.test()
@@ -320,7 +353,7 @@ async def test_10_full_pipeline_zero_data(dut):
 
 
 # ============================================================================
-# 11  FULL PIPELINE — REAL ADC DATA
+# 11  FULL PIPELINE -- REAL ADC DATA
 # ============================================================================
 
 @cocotb.test()
@@ -421,15 +454,15 @@ async def test_15_uio_oe(dut):
 
 
 # ============================================================================
-# 16  SIGN EXTENSION — NEGATIVE ADC VALUES
+# 16  SIGN EXTENSION -- NEGATIVE ADC VALUES
 # ============================================================================
 
 @cocotb.test()
 async def test_16_negative_adc(dut):
-    """Pipeline handles negative 4-bit ADC codes (bit 3 = 1 → sign extend)."""
+    """Pipeline handles negative 4-bit ADC codes (bit 3 = 1 -> sign extend)."""
     await init(dut)
 
-    # 4-bit two's complement negatives: 8→-8, 9→-7, … 15→-1
+    # 4-bit two's complement negatives: 8->-8, 9->-7, ... 15->-1
     neg = [8, 10, 12, 14, 9, 11, 13, 15]
     for s in neg:
         await feed_sample(dut, s)
@@ -441,7 +474,7 @@ async def test_16_negative_adc(dut):
 
 
 # ============================================================================
-# 17  SIGN EXTENSION — MIXED POLARITY
+# 17  SIGN EXTENSION -- MIXED POLARITY
 # ============================================================================
 
 @cocotb.test()
@@ -460,7 +493,7 @@ async def test_17_mixed_polarity(dut):
 
 
 # ============================================================================
-# 18  NEW: LSK PACKET PROTOCOL DECODE
+# 18  LSK PACKET PROTOCOL DECODE
 # ============================================================================
 
 @cocotb.test()
@@ -530,7 +563,7 @@ async def test_18_lsk_packet_decode(dut):
 
 
 # ============================================================================
-# 19  NEW: SPURIOUS WAKE (NO-OP)
+# 19  SPURIOUS WAKE (NO-OP)
 # ============================================================================
 
 @cocotb.test()
@@ -557,7 +590,7 @@ async def test_19_spurious_wake(dut):
 
 
 # ============================================================================
-# 20  NEW: SPURIOUS ADC DATA (NOISE)
+# 20  SPURIOUS ADC DATA (NOISE)
 # ============================================================================
 
 @cocotb.test()
@@ -584,41 +617,43 @@ async def test_20_spurious_adc_data(dut):
 
 
 # ============================================================================
-# 21  NEW: DC INPUT SPECTRUM
+# 21  DC INPUT -- COMMAND MAKES SENSE FOR TARGET
 # ============================================================================
 
 @cocotb.test()
-async def test_21_dc_input_spectrum(dut):
-    """Feed Constant DC. High bins should be 0. Cmd should be low."""
+async def test_21_dc_input_with_target(dut):
+    """
+    Feed constant DC input.  With zero-init DWT buffer, the single non-zero
+    LMS output creates an impulse whose energy lands in a detail bin (bin 4).
+    With target_idx = 0, the error controller should issue a DEC command
+    (dominant > target).
+    """
     await init(dut)
+    set_target_idx(dut, 0)
 
-    # Fill DWT buffer with constant value (DC)
-    # Need >8 samples to flush LMS history
+    # Fill LMS delay line with constant value (DC)
     for _ in range(16):
-        await feed_sample(dut, 4) # Constant 4
+        await feed_sample(dut, 4)
 
-    await pulse_wake(dut)
-    await wait_for(dut, cmd_valid, 1, timeout=3000)
+    ok, cmd = await run_and_get_cmd(dut)
+    assert ok, "Pipeline did not complete (DC data, target=0)"
+    dut._log.info(f"  DC Input, target=0 -> Command: {cmd}")
 
-    cmd = cmd_out(dut)
-    dut._log.info(f"  DC Input -> Command: {cmd}")
-
-    # Haar Wavelet DWT kills DC in detail coefficients.
-    # Energy should be concentrated in lowest bin or DC-leakage.
-    # We expect a low bin index (0, 1, or 2).
-    assert cmd <= 2, f"DC input produced high frequency bin {cmd}!"
-    dut._log.info("PASS: DC input correctly classified as low frequency")
+    # With target=0 and dominant bin > 0, we expect a DEC command
+    assert cmd in (CMD_DEC_1HZ, CMD_DEC_FAST), \
+        f"Expected DEC command for DC input with target=0, got {cmd}"
+    dut._log.info("PASS: DC input correctly generated DEC command relative to target")
 
 
 # ============================================================================
-# 22  NEW: HIGH FREQ INPUT SPECTRUM (STEP)
+# 22  COMPLEX INPUT DETERMINISM
 # ============================================================================
 
 @cocotb.test()
 async def test_22_complex_input_determinism(dut):
     """
     Feed Complex/High-Freq Input (Nyquist) and verify deterministic output.
-    Note: On a Cold Start (filter empty), the filter fill-up transient 
+    Note: On a Cold Start (filter empty), the filter fill-up transient
     creates a large DC-like ramp, which often results in Bin 0 dominating.
     We therefore check that the output is VALID, not necessarily HIGH-FREQ.
     """
@@ -635,23 +670,23 @@ async def test_22_complex_input_determinism(dut):
 
     cmd = cmd_out(dut)
     dut._log.info(f"  Complex Input -> Resulting Command: {cmd}")
-    
+
     # We assert that the pipeline produced a valid result (cmd_valid fired)
-    # and that the command is within valid 3-bit range.
-    assert 0 <= cmd <= 7, f"Invalid command output: {cmd}"
-    
-    # We log if it was 0, but we do NOT fail the test.
-    if cmd == 0:
-        dut._log.warning("  Command is 0 (DC/Transient Dominant). "
-                         "This is expected for Cold Start.")
+    # and that the command is in the valid command set.
+    valid_cmds = {CMD_HOLD, CMD_INC_1HZ, CMD_DEC_1HZ, CMD_INC_FAST, CMD_DEC_FAST}
+    assert cmd in valid_cmds, f"Invalid command output: {cmd}"
+
+    if cmd == CMD_HOLD:
+        dut._log.warning("  Command is HOLD (dominant matches target=0). "
+                         "Expected for Cold Start.")
     else:
-        dut._log.info("  Command > 0. High frequency detected.")
+        dut._log.info(f"  Command is {cmd}. Error controller active.")
 
     dut._log.info("PASS: Pipeline processed complex input deterministically")
 
 
 # ============================================================================
-# 23  NEW: ASYNC RESET RECOVERY
+# 23  ASYNC RESET RECOVERY
 # ============================================================================
 
 @cocotb.test()
@@ -666,7 +701,7 @@ async def test_23_async_reset_recovery(dut):
 
     dut._log.info("  Asserting Async Reset mid-operation...")
     dut.rst_n.value = 0
-    
+
     # FIX: Wait for full clock cycles to handle Gate-Level propagation delays
     # Timer(1, "ns") was too short for GL simulation.
     await ClockCycles(dut.clk, 2)
@@ -683,7 +718,7 @@ async def test_23_async_reset_recovery(dut):
 
 
 # ============================================================================
-# 24  NEW: WATCHDOG TIMEOUT
+# 24  WATCHDOG TIMEOUT
 # ============================================================================
 
 @cocotb.test()
@@ -717,3 +752,308 @@ async def test_24_watchdog_timeout(dut):
 
     assert fired, "Watchdog failed to force state to SLEEP(13)!"
     dut._log.info("PASS: Watchdog successfully recovered hung FSM")
+
+
+# ############################################################################
+# CLOSED-LOOP ERROR CONTROLLER TESTS (Tests 25-36)
+# ############################################################################
+
+# ============================================================================
+# 25  CMD_HOLD -- Zero data, target matches dominant bin (0)
+# ============================================================================
+
+@cocotb.test()
+async def test_25_cmd_hold_zero_data(dut):
+    """
+    With zero-init buffers, all power bins = 0, dominant = bin 0.
+    Set target_idx = 0  ->  error = 0  ->  CMD_HOLD.
+    """
+    await init(dut)
+    set_target_idx(dut, 0)
+
+    ok, cmd = await run_and_get_cmd(dut)
+    assert ok, "Pipeline did not complete"
+    dut._log.info(f"  Zero data, target=0 -> cmd={cmd}")
+    assert cmd == CMD_HOLD, f"Expected CMD_HOLD (0), got {cmd}"
+    dut._log.info("PASS: CMD_HOLD issued when dominant matches target")
+
+
+# ============================================================================
+# 26  CMD_INC_1HZ -- Zero data, target slightly above dominant
+# ============================================================================
+
+@cocotb.test()
+async def test_26_cmd_inc_1hz(dut):
+    """
+    Zero data -> dominant = bin 0.  target_idx = 1 -> error = +1 -> CMD_INC_1HZ.
+    """
+    await init(dut)
+    set_target_idx(dut, 1)
+
+    ok, cmd = await run_and_get_cmd(dut)
+    assert ok, "Pipeline did not complete"
+    dut._log.info(f"  Zero data, target=1 -> cmd={cmd}")
+    assert cmd == CMD_INC_1HZ, f"Expected CMD_INC_1HZ (1), got {cmd}"
+    dut._log.info("PASS: CMD_INC_1HZ for small positive error")
+
+
+# ============================================================================
+# 27  CMD_INC_1HZ -- Zero data, target 2 above dominant (boundary)
+# ============================================================================
+
+@cocotb.test()
+async def test_27_cmd_inc_1hz_edge(dut):
+    """
+    Zero data -> dominant = bin 0.  target_idx = 2 -> error = +2 -> CMD_INC_1HZ.
+    (Threshold is > 2, so error=2 is still "slight".)
+    """
+    await init(dut)
+    set_target_idx(dut, 2)
+
+    ok, cmd = await run_and_get_cmd(dut)
+    assert ok, "Pipeline did not complete"
+    dut._log.info(f"  Zero data, target=2 -> cmd={cmd}")
+    assert cmd == CMD_INC_1HZ, f"Expected CMD_INC_1HZ (1), got {cmd}"
+    dut._log.info("PASS: CMD_INC_1HZ at boundary (error=2)")
+
+
+# ============================================================================
+# 28  CMD_INC_FAST -- Zero data, target far above dominant
+# ============================================================================
+
+@cocotb.test()
+async def test_28_cmd_inc_fast(dut):
+    """
+    Zero data -> dominant = bin 0.  target_idx = 3 -> error = +3 -> CMD_INC_FAST.
+    """
+    await init(dut)
+    set_target_idx(dut, 3)
+
+    ok, cmd = await run_and_get_cmd(dut)
+    assert ok, "Pipeline did not complete"
+    dut._log.info(f"  Zero data, target=3 -> cmd={cmd}")
+    assert cmd == CMD_INC_FAST, f"Expected CMD_INC_FAST (3), got {cmd}"
+    dut._log.info("PASS: CMD_INC_FAST for large positive error")
+
+
+# ============================================================================
+# 29  CMD_INC_FAST -- Zero data, target = 7 (maximum gap)
+# ============================================================================
+
+@cocotb.test()
+async def test_29_cmd_inc_fast_max(dut):
+    """
+    Zero data -> dominant = bin 0.  target_idx = 7 -> error = +7 -> CMD_INC_FAST.
+    """
+    await init(dut)
+    set_target_idx(dut, 7)
+
+    ok, cmd = await run_and_get_cmd(dut)
+    assert ok, "Pipeline did not complete"
+    dut._log.info(f"  Zero data, target=7 -> cmd={cmd}")
+    assert cmd == CMD_INC_FAST, f"Expected CMD_INC_FAST (3), got {cmd}"
+    dut._log.info("PASS: CMD_INC_FAST at maximum error (7 bins)")
+
+
+# ============================================================================
+# 30  CMD_DEC_1HZ -- DC input creates dominant bin > target
+# ============================================================================
+
+@cocotb.test()
+async def test_30_cmd_dec_1hz(dut):
+    """
+    With constant-4 DC input from cold start, the impulse in the DWT buffer
+    puts energy into bin 4.  Set target_idx = 3 -> error = -1 -> CMD_DEC_1HZ.
+    """
+    await init(dut)
+    set_target_idx(dut, 3)
+
+    for _ in range(8):
+        await feed_sample(dut, 4)
+
+    ok, cmd = await run_and_get_cmd(dut)
+    assert ok, "Pipeline did not complete"
+    dut._log.info(f"  DC-4 input, target=3 -> cmd={cmd}")
+
+    # Dominant should be bin 4 (from impulse analysis).
+    # Error = 4 - 3 = 1 -> CMD_DEC_1HZ
+    assert cmd == CMD_DEC_1HZ, f"Expected CMD_DEC_1HZ (2), got {cmd}"
+    dut._log.info("PASS: CMD_DEC_1HZ when dominant is slightly above target")
+
+
+# ============================================================================
+# 31  CMD_DEC_FAST -- DC input, target far below dominant
+# ============================================================================
+
+@cocotb.test()
+async def test_31_cmd_dec_fast(dut):
+    """
+    DC-4 input -> dominant = bin 4.  target_idx = 0 -> error = -4 -> CMD_DEC_FAST.
+    """
+    await init(dut)
+    set_target_idx(dut, 0)
+
+    for _ in range(8):
+        await feed_sample(dut, 4)
+
+    ok, cmd = await run_and_get_cmd(dut)
+    assert ok, "Pipeline did not complete"
+    dut._log.info(f"  DC-4 input, target=0 -> cmd={cmd}")
+
+    # Error = 4 - 0 = 4 (>2) -> CMD_DEC_FAST
+    assert cmd == CMD_DEC_FAST, f"Expected CMD_DEC_FAST (4), got {cmd}"
+    dut._log.info("PASS: CMD_DEC_FAST when dominant is far above target")
+
+
+# ============================================================================
+# 32  TARGET SWEEP -- Same input, different targets -> different commands
+# ============================================================================
+
+@cocotb.test()
+async def test_32_target_sweep(dut):
+    """
+    Run pipeline with zero data (dominant=0) at multiple target indices.
+    Verify the command changes correctly with the target.
+    """
+    expected = {
+        0: CMD_HOLD,
+        1: CMD_INC_1HZ,
+        2: CMD_INC_1HZ,
+        3: CMD_INC_FAST,
+        5: CMD_INC_FAST,
+        7: CMD_INC_FAST,
+    }
+
+    for target, exp_cmd in expected.items():
+        await init(dut)
+        set_target_idx(dut, target)
+
+        ok, cmd = await run_and_get_cmd(dut)
+        assert ok, f"Pipeline failed for target={target}"
+        dut._log.info(f"  target={target} -> cmd={cmd} (expected={exp_cmd})")
+        assert cmd == exp_cmd, \
+            f"target={target}: expected cmd {exp_cmd}, got {cmd}"
+
+    dut._log.info("PASS: Target sweep produces correct commands across all settings")
+
+
+# ============================================================================
+# 33  COMMAND STABILITY -- Repeated runs with same input yield same command
+# ============================================================================
+
+@cocotb.test()
+async def test_33_cmd_determinism(dut):
+    """Run the same pipeline configuration 3 times; command must be identical."""
+    results = []
+
+    for run in range(3):
+        await init(dut)
+        set_target_idx(dut, 2)
+
+        for s in [3, 7, 2, 5, 1, 6, 4, 0]:
+            await feed_sample(dut, s)
+
+        ok, cmd = await run_and_get_cmd(dut)
+        assert ok, f"Pipeline failed on run {run}"
+        results.append(cmd)
+        dut._log.info(f"  Run {run}: cmd={cmd}")
+
+    assert results[0] == results[1] == results[2], \
+        f"Non-deterministic: {results}"
+    dut._log.info(f"PASS: Command deterministic across 3 runs (cmd={results[0]})")
+
+
+# ============================================================================
+# 34  LSK PACKET CARRIES CORRECT ERROR COMMAND
+# ============================================================================
+
+@cocotb.test()
+async def test_34_lsk_carries_error_cmd(dut):
+    """
+    Verify that the LSK Manchester packet encodes the same command
+    the error controller computed.  Uses two different target settings
+    to confirm the command changes AND is faithfully transmitted.
+    """
+    for target in [0, 5]:
+        await init(dut)
+        set_target_idx(dut, target)
+
+        for s in [3, 7, 2, 5, 1, 6, 4, 0]:
+            await feed_sample(dut, s)
+
+        await pulse_wake(dut)
+        await wait_for(dut, cmd_valid, 1, timeout=2000)
+        expected_cmd = cmd_out(dut)
+        dut._log.info(f"  target={target}: encoder cmd = {expected_cmd}")
+
+        await wait_for(dut, lsk_tx, 1, timeout=100)
+
+        # Manchester decode: sample at center of first half of each bit
+        decoded_bits = []
+        await ClockCycles(dut.clk, 50)  # align to center of first half-bit
+        for _ in range(14):
+            decoded_bits.append(lsk_ctrl(dut))
+            await ClockCycles(dut.clk, 200)
+
+        packet_int = 0
+        for bit in decoded_bits:
+            packet_int = (packet_int << 1) | bit
+
+        rx_cmd = (packet_int >> 3) & 0x7
+        assert rx_cmd == expected_cmd, \
+            f"target={target}: LSK sent {rx_cmd}, encoder had {expected_cmd}"
+        dut._log.info(f"  target={target}: LSK packet cmd = {rx_cmd} OK")
+
+    dut._log.info("PASS: LSK packet faithfully transmits error-controller command")
+
+
+# ============================================================================
+# 35  FULL CLOSED-LOOP SCENARIO -- Field too high, reduce
+# ============================================================================
+
+@cocotb.test()
+async def test_35_tms_field_too_high(dut):
+    """
+    Scenario: TMS is set for target bin 2 (moderate power), but the
+    sensed distortion pattern has dominant energy in a higher bin.
+    The ASIC should issue a DEC command to tell the TMS to reduce output.
+    """
+    await init(dut)
+    set_target_idx(dut, 2)
+
+    # Feed data that will push energy into higher bins
+    # (impulse-like from cold start with value 4 -> dominant ~ bin 4)
+    for _ in range(8):
+        await feed_sample(dut, 4)
+
+    ok, cmd = await run_and_get_cmd(dut)
+    assert ok, "Pipeline did not complete"
+    dut._log.info(f"  TMS scenario (field too high): target=2, cmd={cmd}")
+
+    assert cmd in (CMD_DEC_1HZ, CMD_DEC_FAST), \
+        f"Expected DEC command when field is above target, got {cmd}"
+    dut._log.info("PASS: ASIC correctly instructs TMS to reduce field strength")
+
+
+# ============================================================================
+# 36  FULL CLOSED-LOOP SCENARIO -- Field too low, increase
+# ============================================================================
+
+@cocotb.test()
+async def test_36_tms_field_too_low(dut):
+    """
+    Scenario: TMS target is bin 5 (high power), but sensed field is
+    quiet (zero data -> dominant bin 0).
+    The ASIC should issue an INC_FAST command.
+    """
+    await init(dut)
+    set_target_idx(dut, 5)
+
+    # No meaningful input -> dominant bin stays at 0
+    ok, cmd = await run_and_get_cmd(dut)
+    assert ok, "Pipeline did not complete"
+    dut._log.info(f"  TMS scenario (field too low): target=5, cmd={cmd}")
+
+    assert cmd == CMD_INC_FAST, \
+        f"Expected CMD_INC_FAST when field is far below target, got {cmd}"
+    dut._log.info("PASS: ASIC correctly instructs TMS to increase field strength")

@@ -1,9 +1,9 @@
 # Tiny Tapeout project information
 project:
   title:        "NeuroCore Field Sensor"      # Project title
-  author:       "Christoph Kassir, Daniel Zheng, Ben Liu, Michael Lander"      # Project authors
+  author:       "Christoph Kassir, Ben Liu, Daniel Zheng, Michael Lander"      # Project authors
   discord:      "aatlemidrm, zhinkies, b1ueed, gaminghero279"      # Your discord username, for communication and automatically assigning you a Tapeout role (optional)
-  description:  "Ultra-low-power digital magnetic field sensing system with event-driven LMS, DWT, CORDIC, and LSK modulation"
+  description:  "Ultra-low-power digital TMS magnetic field sensor with closed-loop error control, LMS, DWT, and LSK modulation"
   language:     "Verilog" # other examples include SystemVerilog, Amaranth, VHDL, etc
   clock_hz:     50000000       # Clock frequency in Hz (50 MHz, matching config.json CLOCK_PERIOD=20ns)
 
@@ -47,9 +47,9 @@ pinout:
   uio[0]: "LMS_BUSY"
   uio[1]: "DWT_BUSY"
   uio[2]: "CORDIC_BUSY"
-  uio[3]: ""
-  uio[4]: ""
-  uio[5]: ""
+  uio[3]: "TARGET_IDX0"
+  uio[4]: "TARGET_IDX1"
+  uio[5]: "TARGET_IDX2"
   uio[6]: ""
   uio[7]: ""
 
