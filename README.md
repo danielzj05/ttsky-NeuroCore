@@ -1,5 +1,19 @@
 ![](../../workflows/gds/badge.svg) ![](../../workflows/docs/badge.svg) ![](../../workflows/test/badge.svg) ![](../../workflows/fpga/badge.svg)
 
+## Inspiration
+Current TMS therapies are "open-loop" because doctors set a dial on the machine, but they do not actually know how the magnetic field behaves once it hits the physical tissue. To fix this, we need a way to measure the field from the inside. We envisioned NeuroCore: a battery-free, wireless ASIC that lives inside the cranium, harvesting energy from the TMS pulses to act as a real-time error controller, ensuring the tissue receives the exact magnetic dose intended.
+
+## What it does
+Monitors the Field: It uses an ADC interface (adc_data[3:0]) to capture the raw magnetic field output directly at the tissue level, reading exactly how the tissue is absorbing and distorting the TMS pulse.
+
+Analyzes Distortion: A Haar-Lifting DWT Engine decomposes this field data into 8 frequency subbands to identify the dominant distortion bin.
+
+Acts as an Error Controller: Instead of just reporting what it sees, the chip compares the measured dominant distortion bin against a desired target setting (target_idx[2:0]).
+
+Auto-Adjusts Therapy: Based on that comparison, it issues a proportional 3-bit correction command (cmd_out) back to the TMS machine via LSK backscatter, telling the machine exactly how to adjust its output to hit the target.
+
+Stays Safe: It solves the thermal issue by processing all the error-correction math locally, only transmitting tiny, sparse 14-bit command packets instead of a continuous data stream.
+
 # Tiny Tapeout Verilog Project Template
 
 - [Read the documentation for project](docs/info.md)
