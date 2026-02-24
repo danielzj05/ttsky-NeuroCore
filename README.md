@@ -14,6 +14,9 @@ Auto-Adjusts Therapy: Based on that comparison, it issues a proportional 3-bit c
 
 Stays Safe: It solves the thermal issue by processing all the error-correction math locally, only transmitting tiny, sparse 14-bit command packets instead of a continuous data stream.
 
+# NOTE
+The files currently located in the /docs directory are legacy artifacts generated during the initial hackathon phase. They were not updated after the final layout and verification loop, so they may contain inaccuracies. Please treat the RTL and testbenches in the /src directory as the absolute ground truth for this project.
+
 # Tiny Tapeout Verilog Project Template
 
 - [Read the documentation for project](docs/info.md)
