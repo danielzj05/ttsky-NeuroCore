@@ -1,0 +1,8 @@
+NeuroCore Field Sensor
+Copyright 2024-2026 Ben Liu, Christoph Kassir, Daniel Zheng, Michael Lander
+
+This product includes the NeuroCore closed-loop TMS field sensor ASIC,
+originally developed during the Tiny Tapeout hackathon by the ASIC team at IEEUofT and submitted to the
+SkyWater Sky130 open-source shuttle.
+
+Licensed under the Apache License, Version 2.0.

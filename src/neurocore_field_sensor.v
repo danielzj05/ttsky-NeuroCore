@@ -14,7 +14,7 @@
 //   7. Added $signed() casting to LMS and DWT for proper negative number arithmetic
 //   8. Replaced simulation initials with True Hardware Resets on arrays for GLS
 //
-// Copyright (c) 2024 Design Team
+// Copyright (c) 2024-2026 Christoph Kassir, Ben Liu, Daniel Zheng, Michael Lander
 // SPDX-License-Identifier: Apache-2.0
 // ============================================================================
 

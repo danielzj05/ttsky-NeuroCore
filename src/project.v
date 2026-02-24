@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2024 Design Team
+ * Copyright (c) 2024-2026 Christoph Kassir, Ben Liu, Daniel Zheng, Michael Lander
  * SPDX-License-Identifier: Apache-2.0
  */
 
