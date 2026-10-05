@@ -85,22 +85,18 @@ module neurocore_field_sensor #(
     // ------------------------------------------------------------------------
     // Input synchronisers (2-FF) for wake and adc_valid
     // ------------------------------------------------------------------------
-    reg wake_meta,      wake_sync, wake_sync_d;
+    reg wake_meta,      wake_sync;
     reg adc_valid_meta, adc_valid_sync;
-
-    wire wake_pulse = wake_sync & ~wake_sync_d;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             wake_meta      <= 1'b0;
             wake_sync      <= 1'b0;
-            wake_sync_d    <= 1'b0;
             adc_valid_meta <= 1'b0;
             adc_valid_sync <= 1'b0;
         end else begin
             wake_meta      <= wake;
             wake_sync      <= wake_meta;
-            wake_sync_d    <= wake_sync;
             adc_valid_meta <= adc_valid;
             adc_valid_sync <= adc_valid_meta;
         end
@@ -183,7 +179,7 @@ module neurocore_field_sensor #(
             next_state = S_SLEEP;
         end else begin
             case (state)
-                S_IDLE:       if (wake_pulse) next_state = S_WAKE;
+                S_IDLE:       if (wake_sync) next_state = S_WAKE;
                 S_WAKE:                      next_state = S_FIR;
                 S_FIR:                       next_state = S_WAIT_FIR;
                 S_WAIT_FIR:   if (fir_valid) next_state = S_DWT;

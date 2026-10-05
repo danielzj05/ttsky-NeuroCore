@@ -75,7 +75,8 @@ module tt_um_NeuroCore (
 
     // uio[2:0] are outputs: {reserved = 0, dwt_busy, fir_busy}. uio[7:3] are inputs.
     assign uio_out = {5'b0, 1'b0, dwt_busy, fir_busy};
-    assign uio_oe  = 8'b0000_0111;
+    localparam [7:0] UIO_OE_MASK = 8'h07;
+    assign uio_oe  = UIO_OE_MASK;
 
     // Unused inputs (keeps lint quiet)
     wire _unused = &{ena, ui_in[7:6], uio_in[7:6], uio_in[2:0], 1'b0};
