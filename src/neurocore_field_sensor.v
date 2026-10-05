@@ -632,24 +632,6 @@ module band_power_ts #(
                                   ? {OUT_WIDTH{1'b1}}
                                   : sq_full[OUT_WIDTH-1:0];
 
-    reg [8*OUT_WIDTH-1:0] power_next;
-    always @(*) begin
-        power_next = power;
-        if (running) begin
-            case (idx)
-                3'd0: power_next[0*OUT_WIDTH +: OUT_WIDTH] = sq_sat;
-                3'd1: power_next[1*OUT_WIDTH +: OUT_WIDTH] = sq_sat;
-                3'd2: power_next[2*OUT_WIDTH +: OUT_WIDTH] = sq_sat;
-                3'd3: power_next[3*OUT_WIDTH +: OUT_WIDTH] = sq_sat;
-                3'd4: power_next[4*OUT_WIDTH +: OUT_WIDTH] = sq_sat;
-                3'd5: power_next[5*OUT_WIDTH +: OUT_WIDTH] = sq_sat;
-                3'd6: power_next[6*OUT_WIDTH +: OUT_WIDTH] = sq_sat;
-                3'd7: power_next[7*OUT_WIDTH +: OUT_WIDTH] = sq_sat;
-                default: power_next = power;
-            endcase
-        end
-    end
-
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             power     <= {(8*OUT_WIDTH){1'b0}};
@@ -662,7 +644,23 @@ module band_power_ts #(
                 running <= 1'b1;
                 idx     <= 3'd0;
             end else if (running) begin
-                power <= power_next;
+                case (idx)
+                    3'd0: power <= {power[8*OUT_WIDTH-1:OUT_WIDTH], sq_sat};
+                    3'd1: power <= {power[8*OUT_WIDTH-1:2*OUT_WIDTH], sq_sat,
+                                    power[OUT_WIDTH-1:0]};
+                    3'd2: power <= {power[8*OUT_WIDTH-1:3*OUT_WIDTH], sq_sat,
+                                    power[2*OUT_WIDTH-1:0]};
+                    3'd3: power <= {power[8*OUT_WIDTH-1:4*OUT_WIDTH], sq_sat,
+                                    power[3*OUT_WIDTH-1:0]};
+                    3'd4: power <= {power[8*OUT_WIDTH-1:5*OUT_WIDTH], sq_sat,
+                                    power[4*OUT_WIDTH-1:0]};
+                    3'd5: power <= {power[8*OUT_WIDTH-1:6*OUT_WIDTH], sq_sat,
+                                    power[5*OUT_WIDTH-1:0]};
+                    3'd6: power <= {power[8*OUT_WIDTH-1:7*OUT_WIDTH], sq_sat,
+                                    power[6*OUT_WIDTH-1:0]};
+                    3'd7: power <= {sq_sat, power[7*OUT_WIDTH-1:0]};
+                    default: power <= power;
+                endcase
 
                 if (idx == 3'd7) begin
                     running   <= 1'b0;
