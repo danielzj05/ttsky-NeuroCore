@@ -25,8 +25,20 @@ module tb ();
     wire [7:0] uio_out;
     wire [7:0] uio_oe;
 
-    // Instantiate the Tiny Tapeout wrapper
+`ifdef GL_TEST
+    // Gate-level only: the powered sky130 cell models return X unless
+    // VPWR = 1 and VGND = 0, so the testbench must drive them.
+    wire VPWR = 1'b1;
+    wire VGND = 1'b0;
+`endif
+
+    // Instantiate the Tiny Tapeout wrapper.
+    // Instance name must stay u_dut: test.py uses dut.u_dut in RTL mode.
     tt_um_NeuroCore u_dut (
+`ifdef GL_TEST
+        .VPWR    (VPWR),
+        .VGND    (VGND),
+`endif
         .clk     (clk),
         .rst_n   (rst_n),
         .ena     (ena),
