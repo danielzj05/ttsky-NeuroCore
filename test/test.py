@@ -735,9 +735,9 @@ async def test_24_watchdog_timeout(dut):
 
     # Force state to S_WAIT_FIR (3) but do NOT send fir_valid
     # The FSM will stick here forever unless WDT fires.
-    # Note: Access path traverses tb -> user_project -> sensor -> state
+    # Note: Access path traverses tb -> u_dut -> sensor -> state
     dut._log.info("  Forcing State = S_WAIT_FIR (3)...")
-    dut.user_project.sensor.state.value = 3
+    dut.u_dut.sensor.state.value = 3
 
     # WDT is 16-bit ~32768 cycles.
     dut._log.info("  Waiting for Watchdog (~32768 cycles)...")
@@ -745,7 +745,7 @@ async def test_24_watchdog_timeout(dut):
     # Polling logic for robust timeout detection
     fired = await wait_for(
         dut,
-        lambda d: safe_int(d.user_project.sensor.state) == 13,
+        lambda d: safe_int(d.u_dut.sensor.state) == 13,
         True,
         timeout=50000
     )
