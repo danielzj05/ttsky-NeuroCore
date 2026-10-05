@@ -6,7 +6,7 @@ SIM ?= icarus
 FST ?= -fst # Use more efficient FST format
 TOPLEVEL_LANG ?= verilog
 SRC_DIR = $(PWD)/../src
-PROJECT_SOURCES = neurocore_field_sensor.v project.v
+PROJECT_SOURCES = neurocore_field_sensor.v tt_um_NeuroCore.v
 
 ifneq ($(GATES),yes)
 
