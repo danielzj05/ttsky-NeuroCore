@@ -1,57 +1,91 @@
 // ============================================================================
-// NeuroCore Field Sensor - Ultra-Low-Power Digital Core (v2)
+// NeuroCore Field Sensor -- event-driven digital core
 // ============================================================================
-// Ultra-low-power magnetic field sensing system with closed-loop feedback
-//
-// Pipeline:
-//   1. FIR artifact filter (8-tap, fixed shift-add coefficients)
-//   2. 3-level Haar DWT (8-sample window, in-place lifting)
-//   3. Absolute-value magnitude extraction
-//   4. Power accumulator (single time-shared squarer)
-//   5. Command encoder (sequential max-finder, 3-bit output)
-//   6. LSK Manchester-encoded packet transmitter
-//
-// Copyright (c) 2024 Design Team
+// Copyright (c) 2024-2026 Christoph Kassir, Ben Liu, Daniel Zheng, Michael Lander
 // SPDX-License-Identifier: Apache-2.0
+//
+// Overview
+// --------
+// An external always-on comparator (not part of this chip) raises `wake` when
+// the sensed signal crosses a coarse threshold. Each wake runs one pass of a
+// fixed-function pipeline, sends the resulting 3-bit command back over an LSK
+// (load-shift-keying) backscatter link, and returns the core to sleep.
+//
+//   adc_data -> FIR filter -> 3-level Haar DWT -> |x| -> x^2 per band
+//                                                              |
+//   target_idx ------------------> dominant-band search -------+
+//                                          |
+//                                    3-bit command -> 14-bit Manchester LSK packet
+//
+// Input timing contract
+// ---------------------
+//   wake        Any pulse >= 1 clk. Sampled only while idle: a wake that
+//               arrives while the pipeline is busy is dropped, not queued.
+//   adc_valid   Exactly 1 clk wide per sample. The sample shift register
+//               advances once per clock that the synchronised strobe is high.
+//   adc_data    NOT synchronised. It is captured two clocks after adc_valid is
+//               first sampled, so the source must hold it stable for at least
+//               3 clocks starting at the adc_valid assertion.
+//   target_idx  Quasi-static frequency-bin index the external TMS should match.
+//               Read by the encoder on the last cycle of its scan.
+//
+// Main FSM
+// --------
+//   IDLE -wake-> WAKE -> FIR -> WAIT_FIR -> DWT -> WAIT_DWT -> ABS -> WAIT_ABS
+//    ^                                                                    |
+//    |     +--------------------------------------------------------------+
+//    |     v
+//    |    BAND -> WAIT_BAND -> ENCODE -> LSK_TX -> LSK_ACK -> LSK_WAIT
+//    |                                                            |
+//    +--- SLEEP <-------------------------------------------------+
+//
+//   Every WAIT_* state advances on its block's `valid` strobe. A watchdog
+//   forces SLEEP if a wait state stalls (see the watchdog comment below).
 // ============================================================================
 
 `default_nettype none
+/* verilator lint_off DECLFILENAME */
 
-// ============================================================================
-// Top-Level Module
-// ============================================================================
 module neurocore_field_sensor #(
-    parameter LMS_TAPS      = 8,
-    parameter LMS_WIDTH     = 8,
-    parameter DWT_LEVELS    = 3,
-    parameter DWT_WIDTH     = 12,
-    parameter NUM_BINS      = 8,
-    parameter CMD_WIDTH     = 3,
-    parameter ADC_BITS      = 4,
-    parameter MAG_WIDTH     = 12,
-    parameter POWER_WIDTH   = 16,
-    parameter WATCHDOG_BITS = 16
+    parameter ADC_BITS  = 4,    // ADC sample width (two's complement)
+    parameter FIR_WIDTH = 8,    // FIR datapath width
+    parameter DWT_WIDTH = 12,   // DWT and magnitude datapath width
+    parameter WDT_BITS  = 16    // Watchdog counter width; timeout = 2^(WDT_BITS-1) clks
 ) (
-    input  wire                  clk,
-    input  wire                  rst_n,
-    input  wire [ADC_BITS-1:0]   adc_data,
-    input  wire                  adc_valid,
-    input  wire                  wake,
-    output wire [CMD_WIDTH-1:0]  cmd_out,
-    output wire                  cmd_valid,
-    output wire                  lsk_ctrl,
-    output wire                  lsk_tx,
-    output wire                  pwr_gate_ctrl,
-    output wire                  lms_busy,
-    output wire                  dwt_busy,
-    output wire                  cordic_busy,
-    output wire                  processing
+    input  wire                clk,
+    input  wire                rst_n,
+
+    // ADC interface
+    input  wire [ADC_BITS-1:0] adc_data,
+    input  wire                adc_valid,
+
+    // Event detection
+    input  wire                wake,
+
+    // Frequency-bin index the external TMS should match
+    input  wire [2:0]          target_idx,
+
+    // Command output
+    output wire [2:0]          cmd_out,
+    output wire                cmd_valid,
+
+    // LSK backscatter modulator
+    output wire                lsk_ctrl,
+    output wire                lsk_tx,
+
+    // Power gating and status
+    output wire                pwr_gate_ctrl,
+    output wire                fir_busy,
+    output wire                dwt_busy,
+    output wire                processing
 );
 
-    // ========================================================================
-    // Synchronizers for async inputs
-    // ========================================================================
-    reg wake_meta, wake_sync;
+    localparam PWR_WIDTH = 16;   // per-band power width
+
+    // ------------------------------------------------------------------------
+    // Input synchronisers (2-FF) for wake and adc_valid
+    // ------------------------------------------------------------------------
+    reg wake_meta,      wake_sync;
     reg adc_valid_meta, adc_valid_sync;
 
     always @(posedge clk or negedge rst_n) begin
@@ -68,303 +102,203 @@ module neurocore_field_sensor #(
         end
     end
 
-    // ========================================================================
-    // Internal Signals
-    // ========================================================================
-    wire [LMS_WIDTH-1:0]     lms_out;
-    wire                     lms_valid;
+    // ------------------------------------------------------------------------
+    // Inter-block signals
+    // ------------------------------------------------------------------------
+    wire [FIR_WIDTH-1:0]       fir_out;
+    wire                       fir_start, fir_valid;
 
-    wire [DWT_WIDTH-1:0]     dwt_out_0, dwt_out_1, dwt_out_2, dwt_out_3;
-    wire [DWT_WIDTH-1:0]     dwt_out_4, dwt_out_5, dwt_out_6, dwt_out_7;
-    wire                     dwt_valid;
+    wire [8*DWT_WIDTH-1:0]     dwt_bus;     // {sub_7 .. sub_0}, see dwt_haar_lift
+    wire                       dwt_start, dwt_valid;
 
-    wire [MAG_WIDTH-1:0]     mag_0, mag_1, mag_2, mag_3;
-    wire [MAG_WIDTH-1:0]     mag_4, mag_5, mag_6, mag_7;
-    wire                     mag_valid;
+    wire [8*DWT_WIDTH-1:0]     abs_bus;     // |sub_n|, same lane order
+    wire                       abs_start, abs_valid;
 
-    wire [POWER_WIDTH-1:0]   power_bins_0, power_bins_1, power_bins_2, power_bins_3;
-    wire [POWER_WIDTH-1:0]   power_bins_4, power_bins_5, power_bins_6, power_bins_7;
-    wire                     acc_valid;
-    wire                     acc_busy_int;
+    wire [8*PWR_WIDTH-1:0]     power_bus;   // sub_n^2, same lane order
+    wire                       bp_start, bp_valid;
 
-    wire [CMD_WIDTH-1:0]     cmd_encoded;
-    wire                     cmd_ready;
+    wire [2:0]                 cmd_encoded;
+    wire                       cmd_ready;
 
-    // ========================================================================
+    // ------------------------------------------------------------------------
     // Main FSM
-    // ========================================================================
-    reg  [3:0] state;
-    reg  [3:0] next_state;
+    // ------------------------------------------------------------------------
+    localparam [3:0] S_IDLE      = 4'd0,
+                     S_WAKE      = 4'd1,
+                     S_FIR       = 4'd2,
+                     S_WAIT_FIR  = 4'd3,
+                     S_DWT       = 4'd4,
+                     S_WAIT_DWT  = 4'd5,
+                     S_ABS       = 4'd6,
+                     S_WAIT_ABS  = 4'd7,
+                     S_BAND      = 4'd8,
+                     S_WAIT_BAND = 4'd9,
+                     S_ENCODE    = 4'd10,
+                     S_LSK_TX    = 4'd11,
+                     S_LSK_WAIT  = 4'd12,
+                     S_SLEEP     = 4'd13,
+                     S_LSK_ACK   = 4'd14;
 
-    localparam S_IDLE        = 4'd0;
-    localparam S_WAKE        = 4'd1;
-    localparam S_COLLECT     = 4'd2;
-    localparam S_WAIT_DWT    = 4'd3;
-    localparam S_MAG         = 4'd4;
-    localparam S_ACCUM       = 4'd5;
-    localparam S_WAIT_ACCUM  = 4'd6;
-    localparam S_ENCODE      = 4'd7;
-    localparam S_LSK_TX      = 4'd8;
-    localparam S_SLEEP       = 4'd9;
+    reg [3:0] state, next_state;
 
-    reg                         lms_start_reg;
-    reg                         sample_pending;
-    reg                         lsk_start_pulse;
-    reg [WATCHDOG_BITS-1:0]     watchdog;
+    // Watchdog: counts consecutive clocks spent in the states listed below. When
+    // the MSB sets (2^(WDT_BITS-1) clocks, 32768 at the default) the FSM is
+    // forced to SLEEP.
+    //   - Covers every state that waits on a done strobe: WAIT_FIR, WAIT_DWT,
+    //     WAIT_ABS, WAIT_BAND and ENCODE.
+    //   - S_ABS and S_LSK_TX are also listed. Each lasts exactly one clock, so
+    //     the only effect is that the count carries straight through them.
+    //   - S_LSK_WAIT is not covered: its length is set by the LSK packet
+    //     (14 * BIT_PERIOD clocks), and lsk_modulator always finishes.
+    //   - The count restarts whenever the FSM passes through a state outside the
+    //     list (S_DWT and S_BAND, for example), so back-to-back covered states
+    //     (WAIT_DWT, ABS, WAIT_ABS and WAIT_BAND, ENCODE, LSK_TX) share one
+    //     timeout.
+    reg  [WDT_BITS-1:0] wdt_cnt;
 
-    // State register
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n)
-            state <= S_IDLE;
-        else
-            state <= next_state;
-    end
+    wire in_watchdog_state = (state == S_WAIT_FIR)  || (state == S_WAIT_DWT)  ||
+                             (state == S_ABS)       || (state == S_WAIT_ABS)  ||
+                             (state == S_WAIT_BAND) || (state == S_ENCODE)    ||
+                             (state == S_LSK_TX);
 
-    // Next-state logic
-    always @(*) begin
-        next_state = state;
-        case (state)
-            S_IDLE: begin
-                if (wake_sync)
-                    next_state = S_WAKE;
-            end
-            S_WAKE: begin
-                next_state = S_COLLECT;
-            end
-            S_COLLECT: begin
-                if (dwt_valid)
-                    next_state = S_MAG;
-                else if (watchdog[WATCHDOG_BITS-1])
-                    next_state = S_SLEEP;
-            end
-            S_WAIT_DWT: begin
-                if (dwt_valid)
-                    next_state = S_MAG;
-                else if (watchdog[WATCHDOG_BITS-1])
-                    next_state = S_SLEEP;
-            end
-            S_MAG: begin
-                if (mag_valid)
-                    next_state = S_ACCUM;
-                else if (watchdog[WATCHDOG_BITS-1])
-                    next_state = S_SLEEP;
-            end
-            S_ACCUM: begin
-                next_state = S_WAIT_ACCUM;
-            end
-            S_WAIT_ACCUM: begin
-                if (acc_valid)
-                    next_state = S_ENCODE;
-                else if (watchdog[WATCHDOG_BITS-1])
-                    next_state = S_SLEEP;
-            end
-            S_ENCODE: begin
-                if (cmd_ready)
-                    next_state = S_LSK_TX;
-                else if (watchdog[WATCHDOG_BITS-1])
-                    next_state = S_SLEEP;
-            end
-            S_LSK_TX: begin
-                if (!lsk_tx)
-                    next_state = S_SLEEP;
-                else if (watchdog[WATCHDOG_BITS-1])
-                    next_state = S_SLEEP;
-            end
-            S_SLEEP: begin
-                next_state = S_IDLE;
-            end
-            default: next_state = S_IDLE;
-        endcase
-    end
+    wire wdt_timeout = in_watchdog_state && wdt_cnt[WDT_BITS-1];
 
-    // ========================================================================
-    // FSM Sequential Control
-    // ========================================================================
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            watchdog        <= {WATCHDOG_BITS{1'b0}};
-            lms_start_reg   <= 1'b0;
-            sample_pending  <= 1'b0;
-            lsk_start_pulse <= 1'b0;
+            state   <= S_IDLE;
+            wdt_cnt <= {WDT_BITS{1'b0}};
         end else begin
-            lms_start_reg   <= 1'b0;
-            lsk_start_pulse <= 1'b0;
-
-            // Watchdog
-            if (state != next_state)
-                watchdog <= {WATCHDOG_BITS{1'b0}};
-            else begin
-                case (state)
-                    S_COLLECT, S_WAIT_DWT, S_WAIT_ACCUM, S_LSK_TX, S_ENCODE, S_MAG:
-                        watchdog <= watchdog + 1'b1;
-                    default:
-                        watchdog <= {WATCHDOG_BITS{1'b0}};
-                endcase
-            end
-
-            // Sample collection during S_COLLECT
-            if (state == S_WAKE)
-                sample_pending <= 1'b0;
-
-            if (state == S_COLLECT) begin
-                if (adc_valid_sync && !sample_pending && !lms_busy) begin
-                    lms_start_reg  <= 1'b1;
-                    sample_pending <= 1'b1;
-                end
-                if (lms_valid)
-                    sample_pending <= 1'b0;
-            end
-
-            // LSK start pulse
-            if (state == S_ENCODE && cmd_ready)
-                lsk_start_pulse <= 1'b1;
+            state   <= next_state;
+            wdt_cnt <= in_watchdog_state ? wdt_cnt + 1'b1 : {WDT_BITS{1'b0}};
         end
     end
 
-    // Control signal assignments
-    wire dwt_start      = (state == S_WAKE);
-    wire dwt_data_valid = lms_valid && (state == S_COLLECT);
-    wire mag_start      = (state == S_MAG);
-    wire acc_start      = (state == S_ACCUM);
+    always @(*) begin
+        next_state = state;
+        if (wdt_timeout) begin
+            next_state = S_SLEEP;
+        end else begin
+            case (state)
+                S_IDLE:       if (wake_sync) next_state = S_WAKE;
+                S_WAKE:                      next_state = S_FIR;
+                S_FIR:                       next_state = S_WAIT_FIR;
+                S_WAIT_FIR:   if (fir_valid) next_state = S_DWT;
+                S_DWT:                       next_state = S_WAIT_DWT;
+                S_WAIT_DWT:   if (dwt_valid) next_state = S_ABS;
+                S_ABS:                       next_state = S_WAIT_ABS;
+                S_WAIT_ABS:   if (abs_valid) next_state = S_BAND;
+                S_BAND:                      next_state = S_WAIT_BAND;
+                S_WAIT_BAND:  if (bp_valid)  next_state = S_ENCODE;
+                S_ENCODE:     if (cmd_ready) next_state = S_LSK_TX;
+                S_LSK_TX:                    next_state = S_LSK_ACK;
+                S_LSK_ACK:                   next_state = S_LSK_WAIT;
+                S_LSK_WAIT:   if (!lsk_tx)   next_state = S_SLEEP;
+                S_SLEEP:                     next_state = S_IDLE;
+                default:                     next_state = S_IDLE;
+            endcase
+        end
+    end
 
-    assign pwr_gate_ctrl = (state != S_IDLE) && (state != S_SLEEP);
-    assign processing    = (state != S_IDLE) && (state != S_SLEEP);
-    assign cordic_busy   = acc_busy_int;
+    // Block start strobes
+    assign fir_start = (state == S_FIR);
+    assign dwt_start = (state == S_DWT);
+    assign abs_start = (state == S_ABS);
+    assign bp_start  = (state == S_BAND);
 
-    // ========================================================================
-    // LMS / FIR Artifact Filter
-    // ========================================================================
-    lms_filter #(
-        .TAPS(LMS_TAPS),
-        .WIDTH(LMS_WIDTH)
-    ) u_lms_filter (
-        .clk(clk),
-        .rst_n(rst_n),
-        .data_in({{(LMS_WIDTH-ADC_BITS){adc_data[ADC_BITS-1]}}, adc_data}),
-        .start(lms_start_reg),
-        .data_out(lms_out),
-        .out_valid(lms_valid),
-        .busy(lms_busy)
+    // Active in every state except IDLE and SLEEP. pwr_gate_ctrl and processing
+    // are currently the same signal. pwr_gate_ctrl is a control output for an
+    // external power switch; nothing inside this module is power-gated.
+    wire core_active = (state != S_IDLE) && (state != S_SLEEP);
+    assign pwr_gate_ctrl = core_active;
+    assign processing    = core_active;
+
+    // One-clock start pulse for the modulator, registered one clock after the
+    // FSM enters S_LSK_TX. S_LSK_ACK then gives tx_active time to rise before
+    // S_LSK_WAIT starts checking it.
+    reg tx_start_r;
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) tx_start_r <= 1'b0;
+        else        tx_start_r <= (state == S_LSK_TX);
+    end
+
+    // ------------------------------------------------------------------------
+    // Datapath
+    // ------------------------------------------------------------------------
+    fir_filter #(
+        .WIDTH (FIR_WIDTH)
+    ) u_fir (
+        .clk        (clk),
+        .rst_n      (rst_n),
+        .data_in    ({{(FIR_WIDTH-ADC_BITS){adc_data[ADC_BITS-1]}}, adc_data}),
+        .data_valid (adc_valid_sync),
+        .start      (fir_start),
+        .data_out   (fir_out),
+        .out_valid  (fir_valid),
+        .busy       (fir_busy)
     );
 
-    // ========================================================================
-    // DWT Engine
-    // ========================================================================
-    dwt_engine #(
-        .LEVELS(DWT_LEVELS),
-        .WIDTH(DWT_WIDTH)
-    ) u_dwt_engine (
-        .clk(clk),
-        .rst_n(rst_n),
-        .data_in({{(DWT_WIDTH-LMS_WIDTH){lms_out[LMS_WIDTH-1]}}, lms_out}),
-        .data_valid(dwt_data_valid),
-        .start(dwt_start),
-        .subband_0(dwt_out_0),
-        .subband_1(dwt_out_1),
-        .subband_2(dwt_out_2),
-        .subband_3(dwt_out_3),
-        .subband_4(dwt_out_4),
-        .subband_5(dwt_out_5),
-        .subband_6(dwt_out_6),
-        .subband_7(dwt_out_7),
-        .out_valid(dwt_valid),
-        .busy(dwt_busy)
+    dwt_haar_lift #(
+        .WIDTH (DWT_WIDTH)
+    ) u_dwt (
+        .clk        (clk),
+        .rst_n      (rst_n),
+        .data_in    ({{(DWT_WIDTH-FIR_WIDTH){fir_out[FIR_WIDTH-1]}}, fir_out}),
+        .data_valid (fir_valid),
+        .start      (dwt_start),
+        .sub_0      (dwt_bus[0*DWT_WIDTH +: DWT_WIDTH]),
+        .sub_1      (dwt_bus[1*DWT_WIDTH +: DWT_WIDTH]),
+        .sub_2      (dwt_bus[2*DWT_WIDTH +: DWT_WIDTH]),
+        .sub_3      (dwt_bus[3*DWT_WIDTH +: DWT_WIDTH]),
+        .sub_4      (dwt_bus[4*DWT_WIDTH +: DWT_WIDTH]),
+        .sub_5      (dwt_bus[5*DWT_WIDTH +: DWT_WIDTH]),
+        .sub_6      (dwt_bus[6*DWT_WIDTH +: DWT_WIDTH]),
+        .sub_7      (dwt_bus[7*DWT_WIDTH +: DWT_WIDTH]),
+        .out_valid  (dwt_valid),
+        .busy       (dwt_busy)
     );
 
-    // ========================================================================
-    // Magnitude Extraction
-    // ========================================================================
-    magnitude_extract #(
-        .WIDTH(MAG_WIDTH)
-    ) u_mag_extract (
-        .clk(clk),
-        .rst_n(rst_n),
-        .start(mag_start),
-        .in_0(dwt_out_0),
-        .in_1(dwt_out_1),
-        .in_2(dwt_out_2),
-        .in_3(dwt_out_3),
-        .in_4(dwt_out_4),
-        .in_5(dwt_out_5),
-        .in_6(dwt_out_6),
-        .in_7(dwt_out_7),
-        .mag_0(mag_0),
-        .mag_1(mag_1),
-        .mag_2(mag_2),
-        .mag_3(mag_3),
-        .mag_4(mag_4),
-        .mag_5(mag_5),
-        .mag_6(mag_6),
-        .mag_7(mag_7),
-        .out_valid(mag_valid)
+    abs_mag_bank #(
+        .WIDTH (DWT_WIDTH)
+    ) u_abs (
+        .clk        (clk),
+        .rst_n      (rst_n),
+        .start      (abs_start),
+        .x          (dwt_bus),
+        .mag        (abs_bus),
+        .out_valid  (abs_valid)
     );
 
-    // ========================================================================
-    // Power Accumulator
-    // ========================================================================
-    power_accumulator #(
-        .IN_WIDTH(MAG_WIDTH),
-        .OUT_WIDTH(POWER_WIDTH),
-        .NUM_BINS(NUM_BINS)
-    ) u_power_acc (
-        .clk(clk),
-        .rst_n(rst_n),
-        .start(acc_start),
-        .mag_in_0(mag_0),
-        .mag_in_1(mag_1),
-        .mag_in_2(mag_2),
-        .mag_in_3(mag_3),
-        .mag_in_4(mag_4),
-        .mag_in_5(mag_5),
-        .mag_in_6(mag_6),
-        .mag_in_7(mag_7),
-        .bin_0(power_bins_0),
-        .bin_1(power_bins_1),
-        .bin_2(power_bins_2),
-        .bin_3(power_bins_3),
-        .bin_4(power_bins_4),
-        .bin_5(power_bins_5),
-        .bin_6(power_bins_6),
-        .bin_7(power_bins_7),
-        .out_valid(acc_valid),
-        .busy(acc_busy_int)
+    band_power_ts #(
+        .IN_WIDTH  (DWT_WIDTH),
+        .OUT_WIDTH (PWR_WIDTH)
+    ) u_band_power (
+        .clk        (clk),
+        .rst_n      (rst_n),
+        .start      (bp_start),
+        .mag        (abs_bus),
+        .power      (power_bus),
+        .out_valid  (bp_valid)
     );
 
-    // ========================================================================
-    // Command Encoder
-    // ========================================================================
     command_encoder #(
-        .NUM_BINS(NUM_BINS),
-        .CMD_WIDTH(CMD_WIDTH),
-        .BIN_WIDTH(POWER_WIDTH)
+        .BIN_WIDTH (PWR_WIDTH)
     ) u_cmd_encoder (
-        .clk(clk),
-        .rst_n(rst_n),
-        .bin_0(power_bins_0),
-        .bin_1(power_bins_1),
-        .bin_2(power_bins_2),
-        .bin_3(power_bins_3),
-        .bin_4(power_bins_4),
-        .bin_5(power_bins_5),
-        .bin_6(power_bins_6),
-        .bin_7(power_bins_7),
-        .encode_en(state == S_ENCODE),
-        .cmd_out(cmd_encoded),
-        .cmd_ready(cmd_ready)
+        .clk        (clk),
+        .rst_n      (rst_n),
+        .power_in   (power_bus),
+        .target_idx (target_idx),
+        .encode_en  (state == S_ENCODE),
+        .cmd_out    (cmd_encoded),
+        .cmd_ready  (cmd_ready)
     );
 
-    // ========================================================================
-    // LSK Modulator
-    // ========================================================================
-    lsk_modulator #(
-        .CMD_WIDTH(CMD_WIDTH)
-    ) u_lsk_mod (
-        .clk(clk),
-        .rst_n(rst_n),
-        .cmd_in(cmd_encoded),
-        .tx_start(lsk_start_pulse),
-        .lsk_ctrl(lsk_ctrl),
-        .tx_active(lsk_tx)
+    lsk_modulator u_lsk_mod (
+        .clk        (clk),
+        .rst_n      (rst_n),
+        .cmd_in     (cmd_encoded),
+        .tx_start   (tx_start_r),
+        .lsk_ctrl   (lsk_ctrl),
+        .tx_active  (lsk_tx)
     );
 
     assign cmd_out   = cmd_encoded;
@@ -373,109 +307,92 @@ module neurocore_field_sensor #(
 endmodule
 
 
+// ############################################################################
+//  Sub-modules
+// ############################################################################
+
 // ============================================================================
-// LMS / FIR Artifact Filter (8-tap, fixed shift-add coefficients)
+// 8-tap FIR filter (fixed coefficients, shift-add, no multipliers)
 // ============================================================================
-// Coefficients (symmetric, sum to 1.0):
-//   [0.25, 0.125, 0.0625, 0.0625, 0.0625, 0.0625, 0.125, 0.25]
-//   Implemented as right-shifts: [2, 3, 4, 4, 4, 4, 3, 2]
+// Smooths the ADC stream before the wavelet stage. The sample shift register
+// advances on every `data_valid`, independent of `start`. A `start` pulse runs
+// one 8-clock shift-and-accumulate pass over the current register contents.
+//
+//   tap       0     1     2     3     4     5     6     7
+//   weight   1/4   1/8   1/16  1/16  1/16  1/16  1/8   1/4      (sum = 1)
+//   shift    >>>2  >>>3  >>>4  >>>4  >>>4  >>>4  >>>3  >>>2
+//
+// All arithmetic is two's complement; the shifts are arithmetic.
+//
+// Each tap is shifted before it is summed, so every term rounds toward minus
+// infinity, and the 4-bit ADC input has no fractional bits to absorb that. The
+// effective DC gain is therefore far from the nominal 1: a constant +7 in gives
+// +2 out, a constant -1 gives -8. Changing this changes every downstream value.
 // ============================================================================
-module lms_filter #(
-    parameter TAPS  = 8,
+module fir_filter #(
     parameter WIDTH = 8
 ) (
-    input  wire                 clk,
-    input  wire                 rst_n,
-    input  wire [WIDTH-1:0]     data_in,
-    input  wire                 start,
-    output reg  [WIDTH-1:0]     data_out,
-    output reg                  out_valid,
-    output wire                 busy
+    input  wire                    clk,
+    input  wire                    rst_n,
+    input  wire [WIDTH-1:0]        data_in,
+    input  wire                    data_valid,   // shift data_in into the delay line
+    input  wire                    start,        // begin one filter pass
+    output reg  signed [WIDTH-1:0] data_out,
+    output reg                     out_valid,    // 1-clk pulse when data_out is final
+    output wire                    busy
 );
 
-    reg [WIDTH-1:0] delay_line [0:TAPS-1];
-    reg [2:0]       tap_count;
-    reg             processing;
+    localparam TAPS = 8;
+    localparam [2:0] LAST_TAP = 3'd7;
 
-    reg signed [WIDTH+2:0] accum;
+    reg signed [WIDTH-1:0] delay_line [0:TAPS-1];
+    reg [2:0] tap_count;
+    reg       running;
+    integer   i;
 
-    // Select current tap value via mux
-    reg [WIDTH-1:0] current_tap;
-    always @(*) begin
-        case (tap_count)
-            3'd0: current_tap = delay_line[0];
-            3'd1: current_tap = delay_line[1];
-            3'd2: current_tap = delay_line[2];
-            3'd3: current_tap = delay_line[3];
-            3'd4: current_tap = delay_line[4];
-            3'd5: current_tap = delay_line[5];
-            3'd6: current_tap = delay_line[6];
-            3'd7: current_tap = delay_line[7];
-            default: current_tap = {WIDTH{1'b0}};
-        endcase
-    end
-
-    // Sign-extend tap to WIDTH+3 bits as a proper signed wire
-    wire signed [WIDTH+2:0] tap_signed = {{3{current_tap[WIDTH-1]}}, current_tap};
-
-    // Compute contribution with arithmetic right shift on signed value
-    reg signed [WIDTH+2:0] tap_contribution;
-    always @(*) begin
-        case (tap_count)
-            3'd0: tap_contribution = tap_signed >>> 2;
-            3'd1: tap_contribution = tap_signed >>> 3;
-            3'd2: tap_contribution = tap_signed >>> 4;
-            3'd3: tap_contribution = tap_signed >>> 4;
-            3'd4: tap_contribution = tap_signed >>> 4;
-            3'd5: tap_contribution = tap_signed >>> 4;
-            3'd6: tap_contribution = tap_signed >>> 3;
-            3'd7: tap_contribution = tap_signed >>> 2;
-            default: tap_contribution = {(WIDTH+3){1'b0}};
-        endcase
-    end
-
-    assign busy = processing;
+    assign busy = running;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            tap_count     <= 3'd0;
-            processing    <= 1'b0;
-            out_valid     <= 1'b0;
-            data_out      <= {WIDTH{1'b0}};
-            accum         <= {(WIDTH+3){1'b0}};
-            delay_line[0] <= {WIDTH{1'b0}};
-            delay_line[1] <= {WIDTH{1'b0}};
-            delay_line[2] <= {WIDTH{1'b0}};
-            delay_line[3] <= {WIDTH{1'b0}};
-            delay_line[4] <= {WIDTH{1'b0}};
-            delay_line[5] <= {WIDTH{1'b0}};
-            delay_line[6] <= {WIDTH{1'b0}};
-            delay_line[7] <= {WIDTH{1'b0}};
+            tap_count <= 3'd0;
+            running   <= 1'b0;
+            out_valid <= 1'b0;
+            data_out  <= {WIDTH{1'b0}};
+            for (i = 0; i < TAPS; i = i + 1)
+                delay_line[i] <= {WIDTH{1'b0}};
         end else begin
             out_valid <= 1'b0;
 
-            if (start && !processing) begin
+            // Sample shift register
+            if (data_valid) begin
                 delay_line[0] <= data_in;
-                delay_line[1] <= delay_line[0];
-                delay_line[2] <= delay_line[1];
-                delay_line[3] <= delay_line[2];
-                delay_line[4] <= delay_line[3];
-                delay_line[5] <= delay_line[4];
-                delay_line[6] <= delay_line[5];
-                delay_line[7] <= delay_line[6];
-
-                processing <= 1'b1;
-                tap_count  <= 3'd0;
-                accum      <= {(WIDTH+3){1'b0}};
+                for (i = 1; i < TAPS; i = i + 1)
+                    delay_line[i] <= delay_line[i-1];
             end
 
-            if (processing) begin
-                accum <= accum + tap_contribution;
+            // Start a pass
+            if (start && !running) begin
+                running   <= 1'b1;
+                tap_count <= 3'd0;
+                data_out  <= {WIDTH{1'b0}};
+            end
 
-                if (tap_count == 3'd7) begin
-                    processing <= 1'b0;
-                    out_valid  <= 1'b1;
-                    data_out   <= accum[WIDTH-1:0] + tap_contribution[WIDTH-1:0];
+            // One tap per clock
+            if (running) begin
+                case (tap_count)
+                    3'd0: data_out <= data_out + (delay_line[0] >>> 2);
+                    3'd1: data_out <= data_out + (delay_line[1] >>> 3);
+                    3'd2: data_out <= data_out + (delay_line[2] >>> 4);
+                    3'd3: data_out <= data_out + (delay_line[3] >>> 4);
+                    3'd4: data_out <= data_out + (delay_line[4] >>> 4);
+                    3'd5: data_out <= data_out + (delay_line[5] >>> 4);
+                    3'd6: data_out <= data_out + (delay_line[6] >>> 3);
+                    3'd7: data_out <= data_out + (delay_line[7] >>> 2);
+                endcase
+
+                if (tap_count == LAST_TAP) begin
+                    running   <= 1'b0;
+                    out_valid <= 1'b1;
                 end else begin
                     tap_count <= tap_count + 3'd1;
                 end
@@ -487,188 +404,143 @@ endmodule
 
 
 // ============================================================================
-// Lifting-Scheme DWT Engine (3-level Haar, 8-sample window)
+// Haar lifting DWT, 3 levels over an 8-sample window
 // ============================================================================
-// Collects 8 input samples, then performs 3-level in-place Haar lifting.
+// `data_valid` writes one sample into an 8-entry circular buffer. Here it is
+// driven by the FIR's `out_valid`, which pulses once per wake, so the buffer
+// holds the FIR output from the last 8 wakes (zeros until it has filled).
+// The write pointer is never reset on `start`. The transform always reads fixed
+// buffer positions [0]..[7]; once the buffer has wrapped, those positions are
+// not in age order.
+// `start` runs the transform over the buffer in four clocks (L1, L2, L3, OUT).
 //
-// Haar lifting per level (operating on pairs):
-//   approx = (even_sample + odd_sample) >> 1   (logical shift, matching original)
-//   detail = even_sample - odd_sample
+// Lifting step on an (even, odd) pair:   d = odd - even;   a = even + d/2
 //
-// Output mapping:
-//   subband_0 = cA3       (DC / lowest frequency)
-//   subband_1 = cD3       (lowest detail)
-//   subband_2 = cD2[0]    (mid detail)
-//   subband_3 = cD2[1]    (mid detail)
-//   subband_4 = cD1[0]    (high detail)
-//   subband_5 = cD1[1]    (high detail)
-//   subband_6 = cD1[2]    (high detail)
-//   subband_7 = cD1[3]    (high detail)
+//   output   contents                  derived from
+//   ------   -----------------------   --------------------------
+//   sub_0    L3 approximation          L2 approx pair
+//   sub_1    L3 detail                 L2 approx pair
+//   sub_2,3  L2 details                L1 approx pairs (0,1), (2,3)
+//   sub_4-7  L1 details                buffer pairs (0,1) .. (6,7)
 // ============================================================================
-module dwt_engine #(
-    parameter LEVELS = 3,
-    parameter WIDTH  = 12
+module dwt_haar_lift #(
+    parameter WIDTH = 12
 ) (
-    input  wire             clk,
-    input  wire             rst_n,
-    input  wire [WIDTH-1:0] data_in,
-    input  wire             data_valid,
-    input  wire             start,
-    output reg  [WIDTH-1:0] subband_0,
-    output reg  [WIDTH-1:0] subband_1,
-    output reg  [WIDTH-1:0] subband_2,
-    output reg  [WIDTH-1:0] subband_3,
-    output reg  [WIDTH-1:0] subband_4,
-    output reg  [WIDTH-1:0] subband_5,
-    output reg  [WIDTH-1:0] subband_6,
-    output reg  [WIDTH-1:0] subband_7,
-    output reg              out_valid,
-    output wire             busy
+    input  wire                    clk,
+    input  wire                    rst_n,
+    input  wire [WIDTH-1:0]        data_in,
+    input  wire                    data_valid,
+    input  wire                    start,
+    output reg  signed [WIDTH-1:0] sub_0,
+    output reg  signed [WIDTH-1:0] sub_1,
+    output reg  signed [WIDTH-1:0] sub_2,
+    output reg  signed [WIDTH-1:0] sub_3,
+    output reg  signed [WIDTH-1:0] sub_4,
+    output reg  signed [WIDTH-1:0] sub_5,
+    output reg  signed [WIDTH-1:0] sub_6,
+    output reg  signed [WIDTH-1:0] sub_7,
+    output reg                     out_valid,
+    output wire                    busy
 );
 
-    localparam NUM_SAMPLES = 8;
+    localparam [2:0] ST_IDLE = 3'd0,
+                     ST_L1   = 3'd1,
+                     ST_L2   = 3'd2,
+                     ST_L3   = 3'd3,
+                     ST_OUT  = 3'd4;
 
-    // Working and snapshot arrays — kept unsigned to match original behavior
-    // Signed arithmetic is done explicitly via sign-extended temporaries
-    reg [WIDTH-1:0] w [0:NUM_SAMPLES-1];
-    reg [WIDTH-1:0] s [0:NUM_SAMPLES-1];
+    function signed [WIDTH-1:0] haar_d(input signed [WIDTH-1:0] even,
+                                       input signed [WIDTH-1:0] odd);
+        haar_d = odd - even;
+    endfunction
 
-    reg [2:0] sample_cnt;
-    reg [2:0] proc_level;
-    reg       collecting;
-    reg       proc_active;
+    function signed [WIDTH-1:0] haar_a(input signed [WIDTH-1:0] even,
+                                       input signed [WIDTH-1:0] odd);
+        haar_a = even + ((odd - even) >>> 1);
+    endfunction
 
-    assign busy = collecting | proc_active;
+    reg signed [WIDTH-1:0] buf_r [0:7];
+    reg [2:0] wr_ptr;
+    reg [2:0] step;
+    reg       proc;
+    integer   i;
 
-    // Signed temporaries for Haar computation
-    // We sign-extend the unsigned w/s values for arithmetic, then truncate back
-    wire signed [WIDTH:0] s0_ext = {s[0][WIDTH-1], s[0]};
-    wire signed [WIDTH:0] s1_ext = {s[1][WIDTH-1], s[1]};
-    wire signed [WIDTH:0] s2_ext = {s[2][WIDTH-1], s[2]};
-    wire signed [WIDTH:0] s3_ext = {s[3][WIDTH-1], s[3]};
-    wire signed [WIDTH:0] s4_ext = {s[4][WIDTH-1], s[4]};
-    wire signed [WIDTH:0] s5_ext = {s[5][WIDTH-1], s[5]};
-    wire signed [WIDTH:0] s6_ext = {s[6][WIDTH-1], s[6]};
-    wire signed [WIDTH:0] s7_ext = {s[7][WIDTH-1], s[7]};
+    // Level-1 results (4 pairs), level-2 results (2 pairs)
+    reg signed [WIDTH-1:0] l1_a0, l1_a1, l1_a2, l1_a3;
+    reg signed [WIDTH-1:0] l1_d0, l1_d1, l1_d2, l1_d3;
+    reg signed [WIDTH-1:0] l2_a0, l2_a1;
+    reg signed [WIDTH-1:0] l2_d0, l2_d1;
+
+    assign busy = proc;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            collecting  <= 1'b0;
-            proc_active <= 1'b0;
-            out_valid   <= 1'b0;
-            sample_cnt  <= 3'd0;
-            proc_level  <= 3'd0;
-            subband_0   <= {WIDTH{1'b0}};
-            subband_1   <= {WIDTH{1'b0}};
-            subband_2   <= {WIDTH{1'b0}};
-            subband_3   <= {WIDTH{1'b0}};
-            subband_4   <= {WIDTH{1'b0}};
-            subband_5   <= {WIDTH{1'b0}};
-            subband_6   <= {WIDTH{1'b0}};
-            subband_7   <= {WIDTH{1'b0}};
-            w[0] <= {WIDTH{1'b0}};
-            w[1] <= {WIDTH{1'b0}};
-            w[2] <= {WIDTH{1'b0}};
-            w[3] <= {WIDTH{1'b0}};
-            w[4] <= {WIDTH{1'b0}};
-            w[5] <= {WIDTH{1'b0}};
-            w[6] <= {WIDTH{1'b0}};
-            w[7] <= {WIDTH{1'b0}};
-            s[0] <= {WIDTH{1'b0}};
-            s[1] <= {WIDTH{1'b0}};
-            s[2] <= {WIDTH{1'b0}};
-            s[3] <= {WIDTH{1'b0}};
-            s[4] <= {WIDTH{1'b0}};
-            s[5] <= {WIDTH{1'b0}};
-            s[6] <= {WIDTH{1'b0}};
-            s[7] <= {WIDTH{1'b0}};
+            wr_ptr    <= 3'd0;
+            step      <= ST_IDLE;
+            proc      <= 1'b0;
+            out_valid <= 1'b0;
+            sub_0 <= 0; sub_1 <= 0; sub_2 <= 0; sub_3 <= 0;
+            sub_4 <= 0; sub_5 <= 0; sub_6 <= 0; sub_7 <= 0;
+            l1_a0 <= 0; l1_a1 <= 0; l1_a2 <= 0; l1_a3 <= 0;
+            l1_d0 <= 0; l1_d1 <= 0; l1_d2 <= 0; l1_d3 <= 0;
+            l2_a0 <= 0; l2_a1 <= 0;
+            l2_d0 <= 0; l2_d1 <= 0;
+            for (i = 0; i < 8; i = i + 1)
+                buf_r[i] <= {WIDTH{1'b0}};
         end else begin
             out_valid <= 1'b0;
 
-            // Phase 1: Arm collection
-            if (start && !collecting && !proc_active) begin
-                collecting <= 1'b1;
-                sample_cnt <= 3'd0;
+            // Collect samples into the circular buffer
+            if (data_valid) begin
+                buf_r[wr_ptr] <= data_in;
+                wr_ptr        <= wr_ptr + 3'd1;
             end
 
-            // Phase 2: Collect 8 samples
-            if (collecting && data_valid) begin
-                w[sample_cnt] <= data_in;
-                if (sample_cnt == 3'd7) begin
-                    collecting  <= 1'b0;
-                    proc_active <= 1'b1;
-                    proc_level  <= 3'd0;
-                end else begin
-                    sample_cnt <= sample_cnt + 3'd1;
+            case (step)
+                ST_IDLE: begin
+                    if (start && !proc) begin
+                        proc <= 1'b1;
+                        step <= ST_L1;
+                    end
                 end
-            end
 
-            // Phase 3: Haar lifting with snapshot pattern
-            if (proc_active) begin
-                case (proc_level)
-                    3'd0: begin
-                        // Snapshot all 8 values
-                        s[0] <= w[0]; s[1] <= w[1];
-                        s[2] <= w[2]; s[3] <= w[3];
-                        s[4] <= w[4]; s[5] <= w[5];
-                        s[6] <= w[6]; s[7] <= w[7];
-                        proc_level <= 3'd1;
-                    end
-                    3'd1: begin
-                        // Level 1: 8 samples -> 4 approx + 4 detail
-                        w[0] <= (s0_ext + s1_ext) >>> 1;
-                        w[1] <= (s2_ext + s3_ext) >>> 1;
-                        w[2] <= (s4_ext + s5_ext) >>> 1;
-                        w[3] <= (s6_ext + s7_ext) >>> 1;
-                        w[4] <= s[0] - s[1];
-                        w[5] <= s[2] - s[3];
-                        w[6] <= s[4] - s[5];
-                        w[7] <= s[6] - s[7];
-                        proc_level <= 3'd2;
-                    end
-                    3'd2: begin
-                        // Snapshot w[0..3] for level 2
-                        s[0] <= w[0]; s[1] <= w[1];
-                        s[2] <= w[2]; s[3] <= w[3];
-                        proc_level <= 3'd3;
-                    end
-                    3'd3: begin
-                        // Level 2: 4 approx -> 2 approx + 2 detail
-                        w[0] <= (s0_ext + s1_ext) >>> 1;
-                        w[1] <= (s2_ext + s3_ext) >>> 1;
-                        w[2] <= s[0] - s[1];
-                        w[3] <= s[2] - s[3];
-                        proc_level <= 3'd4;
-                    end
-                    3'd4: begin
-                        // Snapshot w[0..1] for level 3
-                        s[0] <= w[0]; s[1] <= w[1];
-                        proc_level <= 3'd5;
-                    end
-                    3'd5: begin
-                        // Level 3: 2 approx -> 1 approx + 1 detail
-                        w[0] <= (s0_ext + s1_ext) >>> 1;
-                        w[1] <= s[0] - s[1];
-                        proc_level <= 3'd6;
-                    end
-                    3'd6: begin
-                        // Output results
-                        subband_0   <= w[0];  // cA3
-                        subband_1   <= w[1];  // cD3
-                        subband_2   <= w[2];  // cD2[0]
-                        subband_3   <= w[3];  // cD2[1]
-                        subband_4   <= w[4];  // cD1[0]
-                        subband_5   <= w[5];  // cD1[1]
-                        subband_6   <= w[6];  // cD1[2]
-                        subband_7   <= w[7];  // cD1[3]
-                        proc_active <= 1'b0;
-                        out_valid   <= 1'b1;
-                    end
-                    default: begin
-                        proc_active <= 1'b0;
-                    end
-                endcase
-            end
+                // Level 1: four pairs from the 8-sample buffer
+                ST_L1: begin
+                    l1_d0 <= haar_d(buf_r[0], buf_r[1]);  l1_a0 <= haar_a(buf_r[0], buf_r[1]);
+                    l1_d1 <= haar_d(buf_r[2], buf_r[3]);  l1_a1 <= haar_a(buf_r[2], buf_r[3]);
+                    l1_d2 <= haar_d(buf_r[4], buf_r[5]);  l1_a2 <= haar_a(buf_r[4], buf_r[5]);
+                    l1_d3 <= haar_d(buf_r[6], buf_r[7]);  l1_a3 <= haar_a(buf_r[6], buf_r[7]);
+                    step  <= ST_L2;
+                end
+
+                // Level 2: two pairs from the four L1 approximations
+                ST_L2: begin
+                    l2_d0 <= haar_d(l1_a0, l1_a1);        l2_a0 <= haar_a(l1_a0, l1_a1);
+                    l2_d1 <= haar_d(l1_a2, l1_a3);        l2_a1 <= haar_a(l1_a2, l1_a3);
+                    step  <= ST_L3;
+                end
+
+                // Level 3: one pair from the two L2 approximations
+                ST_L3: begin
+                    sub_0 <= haar_a(l2_a0, l2_a1);
+                    sub_1 <= haar_d(l2_a0, l2_a1);
+                    sub_2 <= l2_d0;
+                    sub_3 <= l2_d1;
+                    sub_4 <= l1_d0;
+                    sub_5 <= l1_d1;
+                    sub_6 <= l1_d2;
+                    sub_7 <= l1_d3;
+                    step  <= ST_OUT;
+                end
+
+                ST_OUT: begin
+                    out_valid <= 1'b1;
+                    proc      <= 1'b0;
+                    step      <= ST_IDLE;
+                end
+
+                default: step <= ST_IDLE;
+            endcase
         end
     end
 
@@ -676,50 +548,40 @@ endmodule
 
 
 // ============================================================================
-// Magnitude Extraction (Absolute Value)
+// Absolute-value bank (8 lanes)
 // ============================================================================
-module magnitude_extract #(
+// Lanes are packed LSB-first: lane n occupies bits [n*WIDTH +: WIDTH].
+// Combinational |x| with a registered output; `out_valid` follows `start` by
+// one clock.
+// ============================================================================
+module abs_mag_bank #(
     parameter WIDTH = 12
 ) (
     input  wire                clk,
     input  wire                rst_n,
     input  wire                start,
-    input  wire [WIDTH-1:0]    in_0, in_1, in_2, in_3,
-    input  wire [WIDTH-1:0]    in_4, in_5, in_6, in_7,
-    output reg  [WIDTH-1:0]    mag_0, mag_1, mag_2, mag_3,
-    output reg  [WIDTH-1:0]    mag_4, mag_5, mag_6, mag_7,
+    input  wire [8*WIDTH-1:0]  x,
+    output reg  [8*WIDTH-1:0]  mag,
     output reg                 out_valid
 );
 
-    function automatic [WIDTH-1:0] abs_val;
-        input [WIDTH-1:0] val;
-        begin
-            abs_val = val[WIDTH-1] ? (~val + {{(WIDTH-1){1'b0}}, 1'b1}) : val;
-        end
+    localparam LANES = 8;
+
+    function [WIDTH-1:0] abs_val(input [WIDTH-1:0] v);
+        abs_val = v[WIDTH-1] ? (~v + 1'b1) : v;
     endfunction
+
+    integer i;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
+            mag       <= {(8*WIDTH){1'b0}};
             out_valid <= 1'b0;
-            mag_0 <= {WIDTH{1'b0}};
-            mag_1 <= {WIDTH{1'b0}};
-            mag_2 <= {WIDTH{1'b0}};
-            mag_3 <= {WIDTH{1'b0}};
-            mag_4 <= {WIDTH{1'b0}};
-            mag_5 <= {WIDTH{1'b0}};
-            mag_6 <= {WIDTH{1'b0}};
-            mag_7 <= {WIDTH{1'b0}};
         end else begin
             out_valid <= 1'b0;
             if (start) begin
-                mag_0 <= abs_val(in_0);
-                mag_1 <= abs_val(in_1);
-                mag_2 <= abs_val(in_2);
-                mag_3 <= abs_val(in_3);
-                mag_4 <= abs_val(in_4);
-                mag_5 <= abs_val(in_5);
-                mag_6 <= abs_val(in_6);
-                mag_7 <= abs_val(in_7);
+                for (i = 0; i < LANES; i = i + 1)
+                    mag[i*WIDTH +: WIDTH] <= abs_val(x[i*WIDTH +: WIDTH]);
                 out_valid <= 1'b1;
             end
         end
@@ -729,95 +591,68 @@ endmodule
 
 
 // ============================================================================
-// Power Bin Accumulator (Single Time-Shared Squarer)
+// Per-band power, one time-shared multiplier
 // ============================================================================
-module power_accumulator #(
+// Squares each of the 8 magnitudes in turn (one lane per clock) and stores the
+// result; each pass overwrites the previous one. Results saturate at
+// 2^OUT_WIDTH - 1. Lanes are packed LSB-first.
+// ============================================================================
+module band_power_ts #(
     parameter IN_WIDTH  = 12,
-    parameter OUT_WIDTH = 16,
-    parameter NUM_BINS  = 8
+    parameter OUT_WIDTH = 16
 ) (
-    input  wire                  clk,
-    input  wire                  rst_n,
-    input  wire                  start,
-    input  wire [IN_WIDTH-1:0]   mag_in_0, mag_in_1, mag_in_2, mag_in_3,
-    input  wire [IN_WIDTH-1:0]   mag_in_4, mag_in_5, mag_in_6, mag_in_7,
-    output reg  [OUT_WIDTH-1:0]  bin_0, bin_1, bin_2, bin_3,
-    output reg  [OUT_WIDTH-1:0]  bin_4, bin_5, bin_6, bin_7,
-    output reg                   out_valid,
-    output wire                  busy
+    input  wire                   clk,
+    input  wire                   rst_n,
+    input  wire                   start,
+    input  wire [8*IN_WIDTH-1:0]  mag,
+    output reg  [8*OUT_WIDTH-1:0] power,
+    output reg                    out_valid
 );
 
-    reg [2:0]          bin_idx;
-    reg                processing;
-    reg [IN_WIDTH-1:0] current_mag;
+    reg [2:0] idx;
+    reg       running;
+    integer   j;
 
-    wire [2*IN_WIDTH-1:0] squared = current_mag * current_mag;
-
-    wire [OUT_WIDTH-1:0] squared_out;
-    generate
-        if (2*IN_WIDTH > OUT_WIDTH)
-            assign squared_out = squared[2*IN_WIDTH-1 -: OUT_WIDTH];
-        else
-            assign squared_out = {{(OUT_WIDTH-2*IN_WIDTH){1'b0}}, squared};
-    endgenerate
-
-    assign busy = processing;
-
-    // Next magnitude mux
-    reg [IN_WIDTH-1:0] next_mag;
+    // Lane select. Loop bounds and offsets are constants, so this elaborates to
+    // an 8:1 mux and per-lane write enables. (Variable part-selects on idx, for
+    // reads or writes, synthesise to barrel shifters instead; in Yosys that
+    // version came out about 1.8x larger.)
+    reg [IN_WIDTH-1:0] cur_mag;
     always @(*) begin
-        case (bin_idx + 3'd1)
-            3'd1:    next_mag = mag_in_1;
-            3'd2:    next_mag = mag_in_2;
-            3'd3:    next_mag = mag_in_3;
-            3'd4:    next_mag = mag_in_4;
-            3'd5:    next_mag = mag_in_5;
-            3'd6:    next_mag = mag_in_6;
-            3'd7:    next_mag = mag_in_7;
-            default: next_mag = {IN_WIDTH{1'b0}};
-        endcase
+        cur_mag = mag[0 +: IN_WIDTH];
+        for (j = 1; j < 8; j = j + 1)
+            if (idx == j[2:0])
+                cur_mag = mag[j*IN_WIDTH +: IN_WIDTH];
     end
+
+    wire [2*IN_WIDTH-1:0] sq_full = cur_mag * cur_mag;
+
+    // Keep the low OUT_WIDTH bits; saturate if the square needs more.
+    wire [OUT_WIDTH-1:0] sq_sat = (|sq_full[2*IN_WIDTH-1:OUT_WIDTH])
+                                  ? {OUT_WIDTH{1'b1}}
+                                  : sq_full[OUT_WIDTH-1:0];
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            bin_0       <= {OUT_WIDTH{1'b0}};
-            bin_1       <= {OUT_WIDTH{1'b0}};
-            bin_2       <= {OUT_WIDTH{1'b0}};
-            bin_3       <= {OUT_WIDTH{1'b0}};
-            bin_4       <= {OUT_WIDTH{1'b0}};
-            bin_5       <= {OUT_WIDTH{1'b0}};
-            bin_6       <= {OUT_WIDTH{1'b0}};
-            bin_7       <= {OUT_WIDTH{1'b0}};
-            out_valid   <= 1'b0;
-            processing  <= 1'b0;
-            bin_idx     <= 3'd0;
-            current_mag <= {IN_WIDTH{1'b0}};
+            power     <= {(8*OUT_WIDTH){1'b0}};
+            out_valid <= 1'b0;
+            idx       <= 3'd0;
+            running   <= 1'b0;
         end else begin
             out_valid <= 1'b0;
+            if (start && !running) begin
+                running <= 1'b1;
+                idx     <= 3'd0;
+            end else if (running) begin
+                for (j = 0; j < 8; j = j + 1)
+                    if (idx == j[2:0])
+                        power[j*OUT_WIDTH +: OUT_WIDTH] <= sq_sat;
 
-            if (start && !processing) begin
-                processing  <= 1'b1;
-                bin_idx     <= 3'd0;
-                current_mag <= mag_in_0;
-            end else if (processing) begin
-                case (bin_idx)
-                    3'd0: bin_0 <= squared_out;
-                    3'd1: bin_1 <= squared_out;
-                    3'd2: bin_2 <= squared_out;
-                    3'd3: bin_3 <= squared_out;
-                    3'd4: bin_4 <= squared_out;
-                    3'd5: bin_5 <= squared_out;
-                    3'd6: bin_6 <= squared_out;
-                    3'd7: bin_7 <= squared_out;
-                    default: ;
-                endcase
-
-                if (bin_idx == 3'd7) begin
-                    processing <= 1'b0;
-                    out_valid  <= 1'b1;
+                if (idx == 3'd7) begin
+                    running   <= 1'b0;
+                    out_valid <= 1'b1;
                 end else begin
-                    bin_idx     <= bin_idx + 3'd1;
-                    current_mag <= next_mag;
+                    idx <= idx + 3'd1;
                 end
             end
         end
@@ -827,68 +662,87 @@ endmodule
 
 
 // ============================================================================
-// Command Encoder (Sequential Max-Finder)
+// Command encoder (closed-loop frequency controller)
+// ============================================================================
+// Scans the 8 band powers for the dominant band, compares its index to
+// `target_idx`, and emits a command telling the external TMS which way to move.
+//
+//   cmd   name          meaning
+//   ---   -----------   -------------------------------------------
+//   000   HOLD          dominant band == target
+//   001   INC_1HZ       dominant band is 1-2 bins below target
+//   010   DEC_1HZ       dominant band is 1-2 bins above target
+//   011   INC_FAST      dominant band is 3+ bins below target
+//   100   DEC_FAST      dominant band is 3+ bins above target
+//   111   (reserved)    safety stop; not generated by this encoder
+//
+// Ties go to the lowest band index. `cmd_ready` rises when `cmd_out` is valid
+// and drops one clock after `encode_en` falls. `cmd_out` holds its value until
+// the next scan completes.
 // ============================================================================
 module command_encoder #(
-    parameter NUM_BINS  = 8,
-    parameter CMD_WIDTH = 3,
     parameter BIN_WIDTH = 16
 ) (
-    input  wire                  clk,
-    input  wire                  rst_n,
-    input  wire [BIN_WIDTH-1:0]  bin_0, bin_1, bin_2, bin_3,
-    input  wire [BIN_WIDTH-1:0]  bin_4, bin_5, bin_6, bin_7,
-    input  wire                  encode_en,
-    output reg  [CMD_WIDTH-1:0]  cmd_out,
-    output reg                   cmd_ready
+    input  wire                   clk,
+    input  wire                   rst_n,
+    input  wire [8*BIN_WIDTH-1:0] power_in,    // lane n at [n*BIN_WIDTH +: BIN_WIDTH]
+    input  wire [2:0]             target_idx,
+    input  wire                   encode_en,
+    output reg  [2:0]             cmd_out,
+    output reg                    cmd_ready
 );
 
+    localparam [2:0] CMD_HOLD     = 3'b000,
+                     CMD_INC_1HZ  = 3'b001,
+                     CMD_DEC_1HZ  = 3'b010,
+                     CMD_INC_FAST = 3'b011,
+                     CMD_DEC_FAST = 3'b100;
+
     reg [BIN_WIDTH-1:0] max_bin;
-    reg [CMD_WIDTH-1:0] max_idx;
-    reg [3:0]           scan_idx;
+    reg [2:0]           max_idx;
+    reg [3:0]           scan_idx;   // 1..7 = compare lane, 8 = decide
     reg                 scanning;
 
-    reg [BIN_WIDTH-1:0] current_bin;
-    always @(*) begin
-        case (scan_idx)
-            4'd1:    current_bin = bin_1;
-            4'd2:    current_bin = bin_2;
-            4'd3:    current_bin = bin_3;
-            4'd4:    current_bin = bin_4;
-            4'd5:    current_bin = bin_5;
-            4'd6:    current_bin = bin_6;
-            4'd7:    current_bin = bin_7;
-            default: current_bin = {BIN_WIDTH{1'b0}};
-        endcase
-    end
+    wire [BIN_WIDTH-1:0] cur_bin  = power_in[scan_idx[2:0]*BIN_WIDTH +: BIN_WIDTH];
+    wire [2:0]           above_by = max_idx - target_idx;   // valid if max_idx > target_idx
+    wire [2:0]           below_by = target_idx - max_idx;   // valid if max_idx < target_idx
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            cmd_out   <= {CMD_WIDTH{1'b0}};
+            cmd_out   <= 3'b000;
             cmd_ready <= 1'b0;
             max_bin   <= {BIN_WIDTH{1'b0}};
-            max_idx   <= {CMD_WIDTH{1'b0}};
+            max_idx   <= 3'd0;
             scan_idx  <= 4'd0;
             scanning  <= 1'b0;
         end else begin
-            cmd_ready <= 1'b0;
+            if (!encode_en)
+                cmd_ready <= 1'b0;
 
-            if (encode_en && !scanning) begin
-                max_bin  <= bin_0;
-                max_idx  <= {CMD_WIDTH{1'b0}};
+            if (encode_en && !scanning && !cmd_ready) begin
+                // Seed the search with lane 0
+                max_bin  <= power_in[BIN_WIDTH-1:0];
+                max_idx  <= 3'd0;
                 scan_idx <= 4'd1;
                 scanning <= 1'b1;
             end else if (scanning) begin
-                if (scan_idx <= 4'd7) begin
-                    if (current_bin > max_bin) begin
-                        max_bin <= current_bin;
-                        max_idx <= scan_idx[CMD_WIDTH-1:0];
-                    end
-                    scan_idx <= scan_idx + 4'd1;
-                end else begin
-                    cmd_out   <= max_idx;
+                if (scan_idx == 4'd8) begin
+                    // Decide: compare the dominant band with the target
+                    if (max_idx == target_idx)
+                        cmd_out <= CMD_HOLD;
+                    else if (max_idx > target_idx)
+                        cmd_out <= (above_by > 3'd2) ? CMD_DEC_FAST : CMD_DEC_1HZ;
+                    else
+                        cmd_out <= (below_by > 3'd2) ? CMD_INC_FAST : CMD_INC_1HZ;
+
                     cmd_ready <= 1'b1;
                     scanning  <= 1'b0;
+                end else begin
+                    if (cur_bin > max_bin) begin
+                        max_bin <= cur_bin;
+                        max_idx <= scan_idx[2:0];
+                    end
+                    scan_idx <= scan_idx + 4'd1;
                 end
             end
         end
@@ -898,72 +752,70 @@ endmodule
 
 
 // ============================================================================
-// LSK Modulator (Manchester-Encoded 14-bit Packet)
+// LSK modulator -- 14-bit Manchester packet, MSB first
 // ============================================================================
-// Packet: [1010][1100][cmd2 cmd1 cmd0][parity][11]
-// Manchester: bit=1 -> HIGH then LOW; bit=0 -> LOW then HIGH
-// MSB transmitted first (bit_count 13 down to 0).
+// Packet (bit 13 sent first):
+//
+//   [13:10]  [9:6]  [5:3]  [2]     [1:0]
+//   1010     1100   cmd    parity  11
+//   preamble sync   3 bits XOR(cmd) postamble
+//
+// Each bit lasts BIT_PERIOD clocks: the first half carries the bit, the second
+// half carries its complement. A full packet is 14 * BIT_PERIOD = 2800 clocks
+// at the default. `tx_active` is high for the whole packet and `lsk_ctrl`
+// returns low afterwards.
 // ============================================================================
 module lsk_modulator #(
-    parameter CMD_WIDTH  = 3,
-    parameter BIT_PERIOD = 1000
+    parameter BIT_PERIOD = 200
 ) (
-    input  wire                 clk,
-    input  wire                 rst_n,
-    input  wire [CMD_WIDTH-1:0] cmd_in,
-    input  wire                 tx_start,
-    output reg                  lsk_ctrl,
-    output reg                  tx_active
+    input  wire       clk,
+    input  wire       rst_n,
+    input  wire [2:0] cmd_in,
+    input  wire       tx_start,     // 1-clk pulse; ignored while transmitting
+    output reg        lsk_ctrl,
+    output reg        tx_active
 );
 
-    localparam PACKET_LEN  = 14;
-    localparam HALF_PERIOD = BIT_PERIOD / 2;
-    localparam TIMER_W     = 10;  // Fixed width: 10 bits holds 0-1023, sufficient for BIT_PERIOD=1000
+    localparam [3:0]  LAST_BIT    = 4'd13;
+    localparam [10:0] LAST_TICK   = BIT_PERIOD[10:0] - 11'd1;
+    localparam [10:0] HALF_PERIOD = BIT_PERIOD[10:0] / 2;
 
-    reg [PACKET_LEN-1:0] packet_reg;
-    reg [3:0]            bit_count;
-    reg [TIMER_W-1:0]    bit_timer;
-    reg                  transmitting;
+    reg [13:0] tx_shift_reg;
+    reg [3:0]  bit_count;
+    reg [10:0] bit_timer;
+    reg        transmitting;
 
-    wire parity = cmd_in[2] ^ cmd_in[1] ^ cmd_in[0];
-
-    wire [PACKET_LEN-1:0] full_packet = {
-        4'b1010,
-        4'b1100,
-        cmd_in,
-        parity,
-        2'b11
-    };
+    wire parity = ^cmd_in;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             lsk_ctrl     <= 1'b0;
             tx_active    <= 1'b0;
             transmitting <= 1'b0;
-            packet_reg   <= {PACKET_LEN{1'b0}};
             bit_count    <= 4'd0;
-            bit_timer    <= {TIMER_W{1'b0}};
+            bit_timer    <= 11'd0;
+            tx_shift_reg <= 14'd0;
         end else begin
-
             if (tx_start && !transmitting) begin
                 transmitting <= 1'b1;
                 tx_active    <= 1'b1;
-                packet_reg   <= full_packet;
-                bit_count    <= 4'd13;
-                bit_timer    <= {TIMER_W{1'b0}};
-                lsk_ctrl     <= full_packet[PACKET_LEN-1];
+                tx_shift_reg <= {4'b1010,    // preamble
+                                 4'b1100,    // sync
+                                 cmd_in,     // command
+                                 parity,     // even-parity bit over cmd
+                                 2'b11};     // postamble
+                bit_count    <= LAST_BIT;
+                bit_timer    <= 11'd0;
             end
 
             if (transmitting) begin
-                bit_timer <= bit_timer + 10'd1;
-
-                if (bit_timer < 10'd500)
-                    lsk_ctrl <= packet_reg[bit_count];
-                else
-                    lsk_ctrl <= ~packet_reg[bit_count];
-
-                if (bit_timer == 10'd999) begin
-                    bit_timer <= {TIMER_W{1'b0}};
+                if (bit_timer < LAST_TICK) begin
+                    bit_timer <= bit_timer + 11'd1;
+                    // Manchester: first half = bit, second half = ~bit
+                    lsk_ctrl <= (bit_timer < HALF_PERIOD) ?  tx_shift_reg[bit_count]
+                                                          : ~tx_shift_reg[bit_count];
+                end else begin
+                    bit_timer <= 11'd0;
                     if (bit_count == 4'd0) begin
                         transmitting <= 1'b0;
                         tx_active    <= 1'b0;
@@ -973,10 +825,9 @@ module lsk_modulator #(
                     end
                 end
             end
-
         end
     end
 
 endmodule
 
-`default_nettype none
+`default_nettype wire

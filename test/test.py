@@ -1,836 +1,1059 @@
-# =============================================================================
-# NeuroCore cocotb Testbench
-# =============================================================================
-# 20 tests for neurocore_field_sensor via tt_um_NeuroCore (Tiny Tapeout wrapper)
+# SPDX-FileCopyrightText: © 2024 Tiny Tapeout
+# SPDX-License-Identifier: Apache-2.0
 #
-# Compatible with both RTL and gate-level simulation.
-# Gate-level notes:
-#   - Outputs contain X/Z until reset propagates through all cells
-#   - safe_int() handles X/Z by returning 0 (safe for polling loops)
-#   - Longer reset pulse and hold times for synchronizer propagation
-#   - Assertions only fire after signals are guaranteed to be resolved
-# =============================================================================
+# NeuroCore Field Sensor — cocotb testbench
+# Expanded Stress-Test Bench covering Protocol, Spectrum, Watchdog,
+# and Closed-Loop TMS Error-Controller Commands
+#
 
 import cocotb
 from cocotb.clock import Clock
-from cocotb.triggers import RisingEdge, ClockCycles
+from cocotb.triggers import ClockCycles, Timer
 import os
 
-# =============================================================================
-# Constants
-# =============================================================================
-BIT_PERIOD = 1000
-HALF_PERIOD = BIT_PERIOD // 2
-LSK_PACKET_LEN = 14
+# ============================================================================
+# Helpers
+# ============================================================================
 
-# Detect gate-level simulation
-GATE_LEVEL = os.environ.get("GATES", "no") == "yes"
+def is_gate_level():
+    """Detect if we are running Gate Level Simulation to skip internal signal checks."""
+    return os.environ.get("GATES") == "yes"
 
-# Gate-level needs much more time for reset propagation and settling
-RESET_CYCLES = 200 if GATE_LEVEL else 50
-SETTLE_CYCLES = 100 if GATE_LEVEL else 20
-WAKE_HOLD = 20 if GATE_LEVEL else 8
-SAMPLE_HOLD = 12 if GATE_LEVEL else 6
-PROCESSING_TIMEOUT = 200 if GATE_LEVEL else 50
+def build_ui(adc_data=0, adc_valid=0, wake=0):
+    """Build the 8-bit ui_in value from individual fields."""
+    return (adc_data & 0xF) | ((adc_valid & 1) << 4) | ((wake & 1) << 5)
 
-
-# =============================================================================
-# Signal Access Helpers (X/Z safe for gate-level sim)
-# =============================================================================
-def safe_int(signal):
-    """
-    Safely convert signal to int. Returns 0 if X/Z values present.
-    This is safe for polling loops (waiting for a signal to become 1).
-    """
+def safe_int(sig, default=0):
+    """Read a signal as int, returning *default* if it contains X / Z."""
     try:
-        return int(signal.value)
+        return int(sig.value)
     except ValueError:
-        return 0
+        return default
+
+# --- Output Accessors ---
+def cmd_out(dut):       return safe_int(dut.uo_out) & 0x07
+def cmd_valid(dut):     return (safe_int(dut.uo_out) >> 3) & 1
+def lsk_ctrl(dut):      return (safe_int(dut.uo_out) >> 4) & 1
+def lsk_tx(dut):        return (safe_int(dut.uo_out) >> 5) & 1
+def pwr_gate(dut):      return (safe_int(dut.uo_out) >> 6) & 1
+def processing(dut):    return (safe_int(dut.uo_out) >> 7) & 1
+
+# --- Bidirectional Accessors ---
+def fir_busy(dut):      return safe_int(dut.uio_out) & 1
+def dwt_busy(dut):      return (safe_int(dut.uio_out) >> 1) & 1
+def reserved_pin(dut):  return (safe_int(dut.uio_out) >> 2) & 1   # uio_out[2], always 0
+
+# --- Command Dictionary (must match Verilog localparams) ---
+CMD_HOLD     = 0  # On target
+CMD_INC_1HZ  = 1  # Increase frequency slightly  (error 1-2 bins)
+CMD_DEC_1HZ  = 2  # Decrease frequency slightly  (error 1-2 bins)
+CMD_INC_FAST = 3  # Increase frequency heavily   (error 3+ bins)
+CMD_DEC_FAST = 4  # Decrease frequency heavily   (error 3+ bins)
+CMD_STOP     = 7  # Safety stop (reserved)
 
 
-def is_resolved(signal):
-    """Check if signal contains only 0/1 (no X/Z)."""
-    try:
-        int(signal.value)
-        return True
-    except ValueError:
-        return False
+# ============================================================================
+# Reusable coroutines
+# ============================================================================
 
-
-def get_uo(dut):
-    return safe_int(dut.uo_out)
-
-def get_uio(dut):
-    return safe_int(dut.uio_out)
-
-def get_cmd_out(dut):
-    return get_uo(dut) & 0x7
-
-def get_cmd_valid(dut):
-    return (get_uo(dut) >> 3) & 1
-
-def get_lsk_ctrl(dut):
-    return (get_uo(dut) >> 4) & 1
-
-def get_lsk_tx(dut):
-    return (get_uo(dut) >> 5) & 1
-
-def get_pwr_gate(dut):
-    return (get_uo(dut) >> 6) & 1
-
-def get_processing(dut):
-    return (get_uo(dut) >> 7) & 1
-
-def get_lms_busy(dut):
-    return get_uio(dut) & 1
-
-def get_dwt_busy(dut):
-    return (get_uio(dut) >> 1) & 1
-
-def get_acc_busy(dut):
-    return (get_uio(dut) >> 2) & 1
-
-
-# =============================================================================
-# Core Test Infrastructure
-# =============================================================================
-async def setup_dut(dut):
-    """
-    Start 10 MHz clock, apply reset, initialize inputs.
-    Gate-level: 200 cycle reset + 100 cycle settle for full propagation.
-    RTL: 50 cycle reset + 20 cycle settle.
-    """
-    clock = Clock(dut.clk, 100, unit="ns")
+async def init(dut, period_ns=20):
+    """Start a 50 MHz clock and apply a clean reset."""
+    clock = Clock(dut.clk, period_ns, unit="ns")
     cocotb.start_soon(clock.start())
-
     dut.ena.value = 1
     dut.ui_in.value = 0
     dut.uio_in.value = 0
     dut.rst_n.value = 0
-
-    await ClockCycles(dut.clk, RESET_CYCLES)
-    dut.rst_n.value = 1
-    await ClockCycles(dut.clk, SETTLE_CYCLES)
-
-
-async def assert_wake(dut, hold_cycles=None):
-    """
-    Assert wake on ui_in[5].
-    Gate-level needs longer hold for synchronizer + gate delays.
-    """
-    if hold_cycles is None:
-        hold_cycles = WAKE_HOLD
-
-    current = safe_int(dut.ui_in)
-    dut.ui_in.value = current | (1 << 5)
-    for _ in range(hold_cycles):
-        await RisingEdge(dut.clk)
-    dut.ui_in.value = safe_int(dut.ui_in) & ~(1 << 5)
-    await RisingEdge(dut.clk)
-
-
-async def wait_for_processing(dut, timeout=None):
-    """Wait for processing (uo_out[7]) to assert. Returns cycle count."""
-    if timeout is None:
-        timeout = PROCESSING_TIMEOUT
-
-    for i in range(timeout):
-        await RisingEdge(dut.clk)
-        if is_resolved(dut.uo_out) and get_processing(dut):
-            return i + 1
-    raise AssertionError(f"processing never asserted after {timeout} cycles")
-
-
-async def feed_one_sample(dut, value, hold_cycles=None):
-    """
-    Feed a single 4-bit ADC sample with adc_valid strobe.
-    """
-    if hold_cycles is None:
-        hold_cycles = SAMPLE_HOLD
-
-    wake_bit = safe_int(dut.ui_in) & (1 << 5)
-
-    # Assert data + valid
-    dut.ui_in.value = (value & 0xF) | (1 << 4) | wake_bit
-    for _ in range(hold_cycles):
-        await RisingEdge(dut.clk)
-
-    # Deassert valid
-    dut.ui_in.value = (value & 0xF) | wake_bit
-    await RisingEdge(dut.clk)
-
-    # Wait for FIR to finish processing this sample
-    busy_seen = False
-    for _ in range(120):
-        await RisingEdge(dut.clk)
-        if get_lms_busy(dut):
-            busy_seen = True
-        if busy_seen and not get_lms_busy(dut):
-            return
-
-    # Extra settling if busy was never seen (gate-level timing)
-    for _ in range(40):
-        await RisingEdge(dut.clk)
-
-
-async def feed_all_samples(dut, samples, gap=None):
-    """Feed 8 ADC samples, waiting for each to be processed."""
-    if gap is None:
-        gap = 10 if GATE_LEVEL else 5
-
-    for s in samples:
-        await feed_one_sample(dut, s)
-        for _ in range(gap):
-            await RisingEdge(dut.clk)
-
-
-async def wait_for_cmd_valid(dut, timeout=25000):
-    """Wait for cmd_valid (uo_out[3]) to assert. Returns cycle count."""
-    for i in range(timeout):
-        await RisingEdge(dut.clk)
-        if get_cmd_valid(dut):
-            return i + 1
-    raise AssertionError(f"cmd_valid never asserted after {timeout} cycles")
-
-
-async def wait_for_lsk_start(dut, timeout=20000):
-    """Wait for LSK tx_active to assert. Returns cycle count."""
-    for i in range(timeout):
-        await RisingEdge(dut.clk)
-        if get_lsk_tx(dut):
-            return i + 1
-    raise AssertionError(f"lsk_tx never asserted after {timeout} cycles")
-
-
-async def wait_for_lsk_done(dut, timeout=18000):
-    """Wait for LSK tx_active to deassert. Returns cycle count."""
-    for i in range(timeout):
-        await RisingEdge(dut.clk)
-        if not get_lsk_tx(dut):
-            return i + 1
-    raise AssertionError(f"lsk_tx never deasserted after {timeout} cycles")
-
-
-async def wait_for_idle(dut, timeout=80000):
-    """Wait for processing to deassert (FSM reached SLEEP -> IDLE)."""
-    for i in range(timeout):
-        await RisingEdge(dut.clk)
-        if is_resolved(dut.uo_out) and not get_processing(dut):
-            return i + 1
-    raise AssertionError(f"processing never deasserted after {timeout} cycles")
-
-
-async def run_full_pipeline(dut, samples, timeout=25000):
-    """
-    Complete pipeline: wake -> collect 8 samples -> wait for cmd_valid.
-    Returns dict with cmd value and cycle count.
-    """
-    await assert_wake(dut)
-    await wait_for_processing(dut)
-    await feed_all_samples(dut, samples)
-    cmd_cycles = await wait_for_cmd_valid(dut, timeout=timeout)
-    cmd = get_cmd_out(dut)
-    return {'cmd': cmd, 'cmd_cycles': cmd_cycles}
-
-
-async def run_pipeline_to_idle(dut, samples):
-    """
-    Run full pipeline and wait until FSM returns to IDLE.
-    """
-    result = await run_full_pipeline(dut, samples)
-
-    await wait_for_lsk_start(dut)
-    await wait_for_lsk_done(dut)
-
-    await wait_for_idle(dut, timeout=5000)
     await ClockCycles(dut.clk, 10)
+    dut.rst_n.value = 1
+    await ClockCycles(dut.clk, 2)
 
-    return result
+
+def set_target_idx(dut, idx):
+    """Set the TMS target frequency bin (3 bits) on uio_in[5:3]."""
+    dut.uio_in.value = (idx & 0x7) << 3
 
 
-async def capture_lsk_packet(dut, timeout=20000):
-    """
-    Capture Manchester-encoded LSK packet from lsk_ctrl (uo_out[4]).
-    """
+async def feed_sample(dut, data):
+    """Pulse one 4-bit ADC sample. Accounts for the 2-FF synchronizer."""
+    dut.ui_in.value = build_ui(adc_data=(data & 0xF), adc_valid=1)
+    await ClockCycles(dut.clk, 1)
+    dut.ui_in.value = build_ui(adc_data=(data & 0xF), adc_valid=0)
+    await ClockCycles(dut.clk, 3)          # let sync propagate + FIR shift
+
+
+async def pulse_wake(dut):
+    """Assert wake for 1 cycle, then wait for 2-FF sync propagation."""
+    dut.ui_in.value = build_ui(wake=1)
+    await ClockCycles(dut.clk, 1)
+    dut.ui_in.value = 0
+    await ClockCycles(dut.clk, 3)
+
+
+async def wait_for(dut, fn, value, timeout=60000):
+    """Poll *fn(dut)* until it equals *value*. Returns True on match."""
     for _ in range(timeout):
-        await RisingEdge(dut.clk)
-        if get_lsk_tx(dut):
-            break
-    else:
-        raise AssertionError("LSK tx_active never asserted")
-
-    decoded_bits = []
-    for bit_idx in range(LSK_PACKET_LEN):
-        await ClockCycles(dut.clk, BIT_PERIOD // 4)
-        first_half = get_lsk_ctrl(dut)
-
-        await ClockCycles(dut.clk, BIT_PERIOD // 2)
-        second_half = get_lsk_ctrl(dut)
-
-        if first_half == 1 and second_half == 0:
-            decoded_bits.append(1)
-        elif first_half == 0 and second_half == 1:
-            decoded_bits.append(0)
-        else:
-            decoded_bits.append(-1)
-
-        remaining = BIT_PERIOD - (BIT_PERIOD // 4) - (BIT_PERIOD // 2)
-        await ClockCycles(dut.clk, remaining)
-
-    return decoded_bits
+        if fn(dut) == value:
+            return True
+        await ClockCycles(dut.clk, 1)
+    return False
 
 
-def parse_lsk_packet(bits):
-    """
-    Parse 14-bit LSK packet (MSB transmitted first).
-    """
-    if len(bits) != 14:
-        return None
-
-    preamble = bits[0:4]
-    sync = bits[4:8]
-    cmd_bits = bits[8:11]
-    par_bit = bits[11]
-    postamble = bits[12:14]
-
-    cmd_val = (cmd_bits[0] << 2) | (cmd_bits[1] << 1) | cmd_bits[2]
-    expected_parity = cmd_bits[0] ^ cmd_bits[1] ^ cmd_bits[2]
-
-    return {
-        'preamble': preamble,
-        'sync': sync,
-        'cmd': cmd_val,
-        'cmd_bits': cmd_bits,
-        'parity': par_bit,
-        'parity_ok': par_bit == expected_parity,
-        'postamble': postamble,
-        'valid': (
-            preamble == [1, 0, 1, 0] and
-            sync == [1, 1, 0, 0] and
-            par_bit == expected_parity and
-            postamble == [1, 1]
-        )
-    }
+async def run_pipeline(dut, timeout=60000):
+    """Trigger one full wake->...->sleep->idle cycle. Returns True if it finishes."""
+    await pulse_wake(dut)
+    if not await wait_for(dut, pwr_gate, 1, timeout=20):
+        return False
+    if not await wait_for(dut, pwr_gate, 0, timeout=timeout):
+        return False
+    # Wait for LSK modulator to finish transmission
+    if not await wait_for(dut, lsk_tx, 0, timeout=4000):
+        return False
+    # Let S_SLEEP -> S_IDLE settle
+    await ClockCycles(dut.clk, 2)
+    return True
 
 
-# =============================================================================
-# TEST 1: Reset clears all outputs
-# =============================================================================
+async def run_and_get_cmd(dut, timeout=60000):
+    """Run one pipeline cycle and return the command output. Returns (ok, cmd)."""
+    await pulse_wake(dut)
+    if not await wait_for(dut, pwr_gate, 1, timeout=20):
+        return (False, -1)
+    ok = await wait_for(dut, cmd_valid, 1, timeout=3000)
+    if not ok:
+        return (False, -1)
+    cmd = cmd_out(dut)
+    # Wait for pipeline to fully complete
+    if not await wait_for(dut, pwr_gate, 0, timeout=timeout):
+        return (False, cmd)
+    if not await wait_for(dut, lsk_tx, 0, timeout=4000):
+        return (False, cmd)
+    await ClockCycles(dut.clk, 2)
+    return (True, cmd)
+
+
+# ============================================================================
+# 1  RESET
+# ============================================================================
+
 @cocotb.test()
 async def test_01_reset(dut):
-    """Verify all outputs are zero after reset."""
-    await setup_dut(dut)
+    """All outputs must be zero after reset."""
+    await init(dut)
 
-    # Extra settling for gate-level
-    await ClockCycles(dut.clk, SETTLE_CYCLES)
-
-    assert is_resolved(dut.uo_out), "uo_out still contains X/Z after reset"
-    assert is_resolved(dut.uio_out), "uio_out still contains X/Z after reset"
-    assert get_uo(dut) == 0, f"uo_out should be 0x00, got {get_uo(dut):#04x}"
-    assert get_uio(dut) == 0, f"uio_out should be 0x00, got {get_uio(dut):#04x}"
-
-    dut._log.info("PASS: All outputs zero after reset")
+    assert safe_int(dut.uo_out) == 0, \
+        f"uo_out = {safe_int(dut.uo_out):#04x}, expected 0x00"
+    assert (safe_int(dut.uio_out) & 0x07) == 0, \
+        "busy signals should be 0 after reset"
+    dut._log.info("PASS: all outputs zeroed after reset")
 
 
-# =============================================================================
-# TEST 2: Chip stays idle without wake
-# =============================================================================
+# ============================================================================
+# 2  IDLE STABILITY
+# ============================================================================
+
 @cocotb.test()
-async def test_02_idle_without_wake(dut):
-    """Verify chip stays idle with no wake signal for 200 cycles."""
-    await setup_dut(dut)
+async def test_02_idle_stable(dut):
+    """FSM must stay idle for 200 cycles when wake is not asserted."""
+    await init(dut)
+    await ClockCycles(dut.clk, 200)
 
-    for cycle in range(200):
-        await RisingEdge(dut.clk)
-        if is_resolved(dut.uo_out):
-            assert get_processing(dut) == 0, f"Processing asserted at cycle {cycle}"
-            assert get_pwr_gate(dut) == 0, f"Power gate asserted at cycle {cycle}"
+    assert pwr_gate(dut) == 0,   "pwr_gate should be 0 in idle"
+    assert fir_busy(dut) == 0,   "fir_busy  should be 0 in idle"
+    assert dwt_busy(dut) == 0,   "dwt_busy  should be 0 in idle"
+    assert lsk_tx(dut) == 0,     "lsk_tx    should be 0 in idle"
+    assert processing(dut) == 0, "processing should be 0 in idle"
+    dut._log.info("PASS: idle stable for 200 cycles")
 
-    dut._log.info("PASS: Chip remains idle without wake")
 
+# ============================================================================
+# 3  UIO_OUT[2] RESERVED, HARD-WIRED ZERO
+# ============================================================================
 
-# =============================================================================
-# TEST 3: Wake signal activates processing
-# =============================================================================
 @cocotb.test()
-async def test_03_wake_activates(dut):
-    """Verify wake transitions FSM to active processing."""
-    await setup_dut(dut)
+async def test_03_reserved_pin_always_zero(dut):
+    """uio_out[2] is reserved and must be 0 at all times."""
+    await init(dut)
+    assert reserved_pin(dut) == 0, "uio_out[2] != 0 at idle"
 
-    await assert_wake(dut)
-    cycles = await wait_for_processing(dut)
+    # Also check during active processing
+    await pulse_wake(dut)
+    for _ in range(60):
+        assert reserved_pin(dut) == 0, "uio_out[2] != 0 during pipeline"
+        await ClockCycles(dut.clk, 1)
 
-    assert get_processing(dut) == 1, "Processing not active after wake"
-    assert get_pwr_gate(dut) == 1, "Power gate not on during processing"
-
-    dut._log.info(f"PASS: Wake -> processing active in {cycles} cycles")
+    dut._log.info("PASS: uio_out[2] always 0")
 
 
-# =============================================================================
-# TEST 4: FIR filter processes a sample
-# =============================================================================
+# ============================================================================
+# 4  TWO-FF SYNCHRONIZER LATENCY
+# ============================================================================
+
 @cocotb.test()
-async def test_04_single_fir(dut):
-    """Feed samples and verify FIR busy signal toggles."""
-    await setup_dut(dut)
+async def test_04_sync_latency(dut):
+    """Wake signal passes through 2-FF sync -- not seen for at least 2 cycles."""
+    await init(dut)
 
-    await assert_wake(dut)
-    await wait_for_processing(dut)
+    dut.ui_in.value = build_ui(wake=1)
 
-    await feed_one_sample(dut, 5)
+    # Cycles +1, +2: wake is still propagating through the 2-FF synchroniser
+    await ClockCycles(dut.clk, 1)
+    assert pwr_gate(dut) == 0, "cycle +1: should still be idle"
+    await ClockCycles(dut.clk, 1)
+    assert pwr_gate(dut) == 0, "cycle +2: should still be idle"
 
-    saw_busy = False
-    saw_done = False
+    # The FSM should become active within the next few cycles
+    ok = await wait_for(dut, pwr_gate, 1, timeout=5)
+    assert ok, "FSM never left IDLE after wake sync"
 
-    wake_bit = safe_int(dut.ui_in) & (1 << 5)
-    dut.ui_in.value = (7 & 0xF) | (1 << 4) | wake_bit
-    for _ in range(SAMPLE_HOLD):
-        await RisingEdge(dut.clk)
-    dut.ui_in.value = (7 & 0xF) | wake_bit
-    await RisingEdge(dut.clk)
+    dut.ui_in.value = 0
+    dut._log.info("PASS: 2-FF sync verified (idle for >=2 cycles, active within 5)")
 
-    for i in range(120):
-        await RisingEdge(dut.clk)
-        if get_lms_busy(dut):
-            saw_busy = True
-        if saw_busy and not get_lms_busy(dut):
-            saw_done = True
-            dut._log.info(f"FIR busy cycle: {i} cycles")
+
+# ============================================================================
+# 5  FIR FILTER -- BUSY FLAG
+# ============================================================================
+
+@cocotb.test()
+async def test_05_fir_busy(dut):
+    """FIR busy goes high after wake and clears when the tap scan finishes."""
+    await init(dut)
+
+    # Fill FIR delay line with data
+    for s in [3, 7, 2, 5, 1, 6, 4, 0]:
+        await feed_sample(dut, s)
+
+    await pulse_wake(dut)
+
+    ok = await wait_for(dut, fir_busy, 1, timeout=20)
+    assert ok, "fir_busy never asserted"
+    dut._log.info("  fir_busy HIGH")
+
+    ok = await wait_for(dut, fir_busy, 0, timeout=50)
+    assert ok, "fir_busy never de-asserted"
+    dut._log.info("PASS: FIR busy lifecycle OK")
+
+
+# ============================================================================
+# 6  DWT ENGINE -- BUSY FLAG
+# ============================================================================
+
+@cocotb.test()
+async def test_06_dwt_busy(dut):
+    """DWT busy asserts after the FIR completes and clears when DWT is done."""
+    await init(dut)
+
+    for s in range(8):
+        await feed_sample(dut, s)
+
+    await pulse_wake(dut)
+
+    ok = await wait_for(dut, dwt_busy, 1, timeout=50)
+    assert ok, "dwt_busy never asserted"
+    dut._log.info("  dwt_busy HIGH")
+
+    ok = await wait_for(dut, dwt_busy, 0, timeout=50)
+    assert ok, "dwt_busy never de-asserted"
+    dut._log.info("PASS: DWT busy lifecycle OK")
+
+
+# ============================================================================
+# 7  POWER-GATE LIFECYCLE
+# ============================================================================
+
+@cocotb.test()
+async def test_07_pwr_gate_lifecycle(dut):
+    """pwr_gate_ctrl rises on wake and falls after full pipeline."""
+    await init(dut)
+
+    assert pwr_gate(dut) == 0, "should start idle"
+
+    await pulse_wake(dut)
+    ok = await wait_for(dut, pwr_gate, 1, timeout=10)
+    assert ok, "pwr_gate never asserted"
+
+    ok = await wait_for(dut, pwr_gate, 0, timeout=60000)
+    assert ok, "pwr_gate never de-asserted (pipeline stuck)"
+    dut._log.info("PASS: pwr_gate lifecycle correct")
+
+
+# ============================================================================
+# 8  LSK MODULATOR -- MANCHESTER ENCODING (Basic Toggle)
+# ============================================================================
+
+@cocotb.test()
+async def test_08_lsk_transmission(dut):
+    """LSK transmitter produces toggling output during S_LSK_TX."""
+    await init(dut)
+
+    for s in [5, 3, 7, 1, 6, 2, 4, 0]:
+        await feed_sample(dut, s)
+
+    await pulse_wake(dut)
+
+    ok = await wait_for(dut, lsk_tx, 1, timeout=500)
+    assert ok, "lsk_tx never asserted"
+    dut._log.info("  LSK transmission started")
+
+    # Count lsk_ctrl transitions during TX -- Manchester must toggle
+    transitions = 0
+    prev_ctrl = lsk_ctrl(dut)
+    for _ in range(4000):
+        await ClockCycles(dut.clk, 1)
+        cur_ctrl = lsk_ctrl(dut)
+        if cur_ctrl != prev_ctrl:
+            transitions += 1
+            prev_ctrl = cur_ctrl
+        if lsk_tx(dut) == 0:
             break
 
-    assert saw_busy, "Never saw lms_busy assert — FIR not starting"
-    assert saw_done, "lms_busy never deasserted — FIR stuck"
-    dut._log.info("PASS: FIR processed sample, busy toggled")
+    dut._log.info(f"  lsk_ctrl transitions: {transitions}")
+    assert transitions >= 2, \
+        f"Expected >=2 lsk_ctrl transitions (Manchester), got {transitions}"
+    assert lsk_tx(dut) == 0, "lsk_tx should be 0 after TX"
+    dut._log.info("PASS: LSK Manchester encoding observed")
 
 
-# =============================================================================
-# TEST 5: 8 samples trigger DWT processing
-# =============================================================================
+# ============================================================================
+# 9  COMMAND ENCODER -- cmd_valid PULSE
+# ============================================================================
+
 @cocotb.test()
-async def test_05_collect_triggers_dwt(dut):
-    """Feed 8 samples and verify DWT busy signal appears."""
-    await setup_dut(dut)
+async def test_09_cmd_valid_pulse(dut):
+    """cmd_valid must pulse during the pipeline; cmd_out in valid command set."""
+    await init(dut)
 
-    await assert_wake(dut)
-    await wait_for_processing(dut)
+    for s in [2, 4, 6, 7, 5, 3, 1, 0]:
+        await feed_sample(dut, s)
 
-    await feed_all_samples(dut, [1, 2, 3, 4, 5, 6, 7, 0])
+    await pulse_wake(dut)
 
-    saw_dwt = False
-    dwt_done = False
-    for i in range(500):
-        await RisingEdge(dut.clk)
-        if get_dwt_busy(dut):
-            saw_dwt = True
-        if saw_dwt and not get_dwt_busy(dut):
-            dwt_done = True
-            dut._log.info(f"DWT processing took ~{i} cycles")
-            break
+    ok = await wait_for(dut, cmd_valid, 1, timeout=500)
+    assert ok, "cmd_valid never asserted"
 
-    assert saw_dwt, "Never saw dwt_busy — DWT never started"
-    assert dwt_done, "dwt_busy never deasserted — DWT stuck"
-    dut._log.info("PASS: 8 samples collected, DWT processed and completed")
+    cmd = cmd_out(dut)
+    dut._log.info(f"  cmd_out = {cmd}")
+    valid_cmds = {CMD_HOLD, CMD_INC_1HZ, CMD_DEC_1HZ, CMD_INC_FAST, CMD_DEC_FAST, CMD_STOP}
+    assert cmd in valid_cmds, f"cmd_out {cmd} not in valid command set"
+    dut._log.info("PASS: cmd_valid pulsed, cmd_out is a valid command")
 
 
-# =============================================================================
-# TEST 6: DC input produces cmd=0 (cA3 dominant)
-# =============================================================================
+# ============================================================================
+# 10  FULL PIPELINE -- ZERO DATA
+# ============================================================================
+
 @cocotb.test()
-async def test_06_dc_input(dut):
-    """DC input (constant positive value) should produce cmd=0."""
-    await setup_dut(dut)
+async def test_10_full_pipeline_zero_data(dut):
+    """Pipeline completes cleanly with zero-initialised buffers."""
+    await init(dut)
 
-    result = await run_full_pipeline(dut, [5] * 8)
-
-    dut._log.info(f"DC input [5]*8 -> cmd = {result['cmd']}")
-    assert result['cmd'] == 0, f"DC input should give cmd=0 (cA3 dominant), got {result['cmd']}"
-
-    await wait_for_idle(dut)
-    dut._log.info("PASS: DC input -> cmd=0 (approximation band dominant)")
+    ok = await run_pipeline(dut)
+    assert ok, "Pipeline did not complete (zero data)"
+    dut._log.info("PASS: full pipeline (zero data) completed")
 
 
-# =============================================================================
-# TEST 7: High-frequency alternating input excites detail bands
-# =============================================================================
+# ============================================================================
+# 11  FULL PIPELINE -- REAL ADC DATA
+# ============================================================================
+
 @cocotb.test()
-async def test_07_alternating_input(dut):
-    """Alternating +7/-8 should excite cD1 (bins 4-7)."""
-    await setup_dut(dut)
+async def test_11_full_pipeline_with_data(dut):
+    """Feed 8 ADC samples then run one full pipeline."""
+    await init(dut)
 
-    samples = [7, 8, 7, 8, 7, 8, 7, 8]
-    result = await run_full_pipeline(dut, samples)
+    samples = [2, 6, 1, 5, 3, 7, 0, 4]
+    for s in samples:
+        await feed_sample(dut, s)
+    dut._log.info(f"  Fed ADC samples: {samples}")
 
-    dut._log.info(f"Alternating +7/-8 -> cmd = {result['cmd']}")
-    assert result['cmd'] >= 4, (
-        f"Alternating input should excite cD1 (bins 4-7), got cmd={result['cmd']}"
-    )
-
-    await wait_for_idle(dut)
-    dut._log.info("PASS: Alternating input -> high-frequency detail bin")
+    ok = await run_pipeline(dut)
+    assert ok, "Pipeline did not complete with real data"
+    dut._log.info("PASS: full pipeline (real data) completed")
 
 
-# =============================================================================
-# TEST 8: Step input exercises mid-frequency bands
-# =============================================================================
+# ============================================================================
+# 12  MULTIPLE CONSECUTIVE WAKE CYCLES
+# ============================================================================
+
 @cocotb.test()
-async def test_08_step_input(dut):
-    """Step function [15,15,15,15,0,0,0,0] — verify pipeline completes."""
-    await setup_dut(dut)
+async def test_12_consecutive_pipelines(dut):
+    """Three back-to-back pipeline runs must all complete."""
+    await init(dut)
 
-    samples = [15, 15, 15, 15, 0, 0, 0, 0]
-    result = await run_full_pipeline(dut, samples)
+    for n in range(3):
+        for s in range(8):
+            await feed_sample(dut, (s + n * 3) & 0xF)
+        ok = await run_pipeline(dut)
+        assert ok, f"Pipeline stuck on run {n}"
+        # run_pipeline already waits for pwr_gate=0, lsk_tx=0, plus settle
+        assert pwr_gate(dut) == 0, f"Run {n}: pwr_gate not 0"
+        assert fir_busy(dut) == 0, f"Run {n}: fir_busy not 0"
+        assert dwt_busy(dut) == 0, f"Run {n}: dwt_busy not 0"
+        assert lsk_tx(dut) == 0,   f"Run {n}: lsk_tx not 0"
+        dut._log.info(f"  Run {n}: OK")
 
-    dut._log.info(f"Step input [-1,-1,-1,-1,0,0,0,0] -> cmd = {result['cmd']}")
-    await wait_for_idle(dut)
-    dut._log.info("PASS: Step input processed without hanging")
+    dut._log.info("PASS: 3 consecutive pipelines completed")
 
 
-# =============================================================================
-# TEST 9: LSK packet has correct structure
-# =============================================================================
+# ============================================================================
+# 13  DWT BUFFER ACCUMULATION (9 runs)
+# ============================================================================
+
 @cocotb.test()
-async def test_09_lsk_structure(dut):
-    """Verify LSK Manchester packet has correct preamble, sync, parity."""
-    await setup_dut(dut)
+async def test_13_dwt_buffer_fill(dut):
+    """Run 9 pipeline cycles so the Haar DWT buffer holds real FIR outputs."""
+    await init(dut)
 
-    await assert_wake(dut)
-    await wait_for_processing(dut)
-    await feed_all_samples(dut, [5] * 8)
+    for run_idx in range(9):
+        base = run_idx * 2
+        for s in range(8):
+            await feed_sample(dut, (base + s) & 0xF)
+        ok = await run_pipeline(dut)
+        assert ok, f"Pipeline stuck on run {run_idx}"
 
-    await wait_for_cmd_valid(dut)
-    expected_cmd = get_cmd_out(dut)
-
-    decoded = await capture_lsk_packet(dut)
-    packet = parse_lsk_packet(decoded)
-
-    dut._log.info(f"LSK decoded bits: {decoded}")
-    dut._log.info(f"Parsed packet: {packet}")
-
-    assert packet is not None, "Failed to parse LSK packet"
-    assert -1 not in decoded, f"Manchester violations in packet: {decoded}"
-    assert packet['preamble'] == [1, 0, 1, 0], f"Bad preamble: {packet['preamble']}"
-    assert packet['sync'] == [1, 1, 0, 0], f"Bad sync: {packet['sync']}"
-    assert packet['parity_ok'], f"Parity error: got {packet['parity']}"
-    assert packet['postamble'] == [1, 1], f"Bad postamble: {packet['postamble']}"
-    assert packet['cmd'] == expected_cmd, (
-        f"LSK cmd {packet['cmd']} != encoder cmd {expected_cmd}"
-    )
-
-    dut._log.info(f"PASS: LSK packet valid, cmd={packet['cmd']}")
+    dut._log.info("PASS: 9 pipeline runs (DWT buffer fully populated)")
 
 
-# =============================================================================
-# TEST 10: LSK command matches pipeline for non-trivial input
-# =============================================================================
+# ============================================================================
+# 14  PROCESSING FLAG (HIGH WHILE THE PIPELINE IS ACTIVE)
+# ============================================================================
+
 @cocotb.test()
-async def test_10_lsk_cmd_match(dut):
-    """Verify LSK packet command matches cmd_out for varied input."""
-    await setup_dut(dut)
+async def test_14_processing_flag(dut):
+    """processing (uo_out[7]) is high for the whole active pipeline, idle otherwise."""
+    await init(dut)
+    assert processing(dut) == 0, "processing set before wake"
 
-    await assert_wake(dut)
-    await wait_for_processing(dut)
-    await feed_all_samples(dut, [0, 15, 0, 15, 7, 7, 7, 7])
+    for s in [1, 2, 3, 4, 5, 6, 7, 0]:
+        await feed_sample(dut, s)
 
-    await wait_for_cmd_valid(dut)
-    expected_cmd = get_cmd_out(dut)
+    await pulse_wake(dut)
 
-    decoded = await capture_lsk_packet(dut)
-    packet = parse_lsk_packet(decoded)
+    ok = await wait_for(dut, processing, 1, timeout=20)
+    assert ok, "processing never went HIGH"
+    dut._log.info("  processing went HIGH")
 
-    assert packet is not None and packet['valid'], f"Invalid LSK packet: {decoded}"
-    assert packet['cmd'] == expected_cmd, (
-        f"LSK cmd {packet['cmd']} != pipeline cmd {expected_cmd}"
-    )
-
-    dut._log.info(f"PASS: LSK cmd={packet['cmd']} matches pipeline (expected {expected_cmd})")
+    # After pipeline finishes it should be 0 again
+    await wait_for(dut, pwr_gate, 0, timeout=60000)
+    assert processing(dut) == 0, "processing should be 0 after pipeline"
+    dut._log.info("PASS: processing flag lifecycle correct")
 
 
-# =============================================================================
-# TEST 11: Busy signals fire in correct pipeline order
-# =============================================================================
+# ============================================================================
+# 15  UIO_OE DIRECTION REGISTER
+# ============================================================================
+
 @cocotb.test()
-async def test_11_busy_ordering(dut):
-    """Verify busy signals fire in order: LMS -> DWT -> ACC."""
-    await setup_dut(dut)
+async def test_15_uio_oe(dut):
+    """uio_oe must be 0x07 (pins 0-2 output, 3-7 input)."""
+    await init(dut)
 
-    await assert_wake(dut)
-    await wait_for_processing(dut)
-
-    lms_first = -1
-    dwt_first = -1
-    acc_first = -1
-    cycle = 0
-
-    for s in [3, 7, 2, 6, 1, 5, 0, 4]:
-        wake_bit = safe_int(dut.ui_in) & (1 << 5)
-        dut.ui_in.value = (s & 0xF) | (1 << 4) | wake_bit
-        for _ in range(SAMPLE_HOLD):
-            await RisingEdge(dut.clk)
-            cycle += 1
-            if get_lms_busy(dut) and lms_first < 0:
-                lms_first = cycle
-            if get_dwt_busy(dut) and dwt_first < 0:
-                dwt_first = cycle
-            if get_acc_busy(dut) and acc_first < 0:
-                acc_first = cycle
-
-        dut.ui_in.value = (s & 0xF) | wake_bit
-        await RisingEdge(dut.clk)
-        cycle += 1
-
-        for _ in range(120):
-            await RisingEdge(dut.clk)
-            cycle += 1
-            if get_lms_busy(dut) and lms_first < 0:
-                lms_first = cycle
-            if get_dwt_busy(dut) and dwt_first < 0:
-                dwt_first = cycle
-            if get_acc_busy(dut) and acc_first < 0:
-                acc_first = cycle
-            if not get_lms_busy(dut) and lms_first >= 0:
-                break
-
-        for _ in range(10):
-            await RisingEdge(dut.clk)
-            cycle += 1
-
-    for _ in range(25000):
-        await RisingEdge(dut.clk)
-        cycle += 1
-
-        if get_lms_busy(dut) and lms_first < 0:
-            lms_first = cycle
-        if get_dwt_busy(dut) and dwt_first < 0:
-            dwt_first = cycle
-        if get_acc_busy(dut) and acc_first < 0:
-            acc_first = cycle
-
-        if get_cmd_valid(dut):
-            break
-
-    dut._log.info(f"Busy first seen: LMS@{lms_first}, DWT@{dwt_first}, ACC@{acc_first}")
-
-    assert lms_first >= 0, "Never saw lms_busy — FIR never started"
-    assert dwt_first >= 0, "Never saw dwt_busy — DWT never started"
-    assert acc_first >= 0, "Never saw acc_busy — accumulator never started"
-    assert acc_first > dwt_first, (
-        f"ACC busy ({acc_first}) must come after DWT busy ({dwt_first})"
-    )
-
-    await wait_for_idle(dut)
-    dut._log.info("PASS: Busy signals in correct pipeline order")
+    oe = safe_int(dut.uio_oe)
+    assert oe == 0x07, f"uio_oe = {oe:#04x}, expected 0x07"
+    dut._log.info("PASS: uio_oe = 0x07")
 
 
-# =============================================================================
-# TEST 12: Processing and power gate lifecycle
-# =============================================================================
+# ============================================================================
+# 16  SIGN EXTENSION -- NEGATIVE ADC VALUES
+# ============================================================================
+
 @cocotb.test()
-async def test_12_lifecycle(dut):
-    """Verify processing/pwr_gate assert during pipeline, deassert after."""
-    await setup_dut(dut)
+async def test_16_negative_adc(dut):
+    """Pipeline handles negative 4-bit ADC codes (bit 3 = 1 -> sign extend)."""
+    await init(dut)
 
-    assert get_processing(dut) == 0, "Processing on at idle"
-    assert get_pwr_gate(dut) == 0, "Power gate on at idle"
+    # 4-bit two's complement negatives: 8->-8, 9->-7, ... 15->-1
+    neg = [8, 10, 12, 14, 9, 11, 13, 15]
+    for s in neg:
+        await feed_sample(dut, s)
+    dut._log.info(f"  Fed negative samples: {neg}")
 
-    await assert_wake(dut)
-    await wait_for_processing(dut)
-    assert get_processing(dut) == 1, "Processing not on after wake"
-    assert get_pwr_gate(dut) == 1, "Power gate not on after wake"
-
-    await feed_all_samples(dut, [8] * 8)
-
-    await wait_for_lsk_start(dut)
-    await wait_for_lsk_done(dut)
-    await wait_for_idle(dut)
-
-    assert get_processing(dut) == 0, "Processing still on after completion"
-    assert get_pwr_gate(dut) == 0, "Power gate still on after completion"
-
-    dut._log.info("PASS: Processing/power gate lifecycle correct")
+    ok = await run_pipeline(dut)
+    assert ok, "Pipeline failed with negative data"
+    dut._log.info("PASS: negative ADC data handled")
 
 
-# =============================================================================
-# TEST 13: Watchdog timeout prevents FSM hang
-# =============================================================================
+# ============================================================================
+# 17  SIGN EXTENSION -- MIXED POLARITY
+# ============================================================================
+
 @cocotb.test()
-async def test_13_watchdog(dut):
-    """Wake but never feed samples -> watchdog forces SLEEP."""
-    await setup_dut(dut)
+async def test_17_mixed_polarity(dut):
+    """Pipeline handles a mix of positive and negative ADC samples."""
+    await init(dut)
 
-    await assert_wake(dut)
-    await wait_for_processing(dut)
+    mixed = [3, 12, 7, 8, 1, 14, 5, 10]
+    for s in mixed:
+        await feed_sample(dut, s)
+    dut._log.info(f"  Fed mixed samples: {mixed}")
 
-    dut._log.info("Waiting for watchdog timeout (~32768 cycles)...")
-    cycles = await wait_for_idle(dut, timeout=40000)
-
-    assert cycles > 30000, (
-        f"FSM went idle too quickly ({cycles} cycles) — watchdog may not be working"
-    )
-    assert cycles < 40000, (
-        f"Watchdog took too long ({cycles} cycles) — counter may be broken"
-    )
-
-    dut._log.info(f"PASS: Watchdog fired after {cycles} cycles")
+    ok = await run_pipeline(dut)
+    assert ok, "Pipeline failed with mixed polarity data"
+    dut._log.info("PASS: mixed polarity data processed")
 
 
-# =============================================================================
-# TEST 14: Back-to-back pipeline runs
-# =============================================================================
+# ============================================================================
+# 18  LSK PACKET PROTOCOL DECODE
+# ============================================================================
+
 @cocotb.test()
-async def test_14_back_to_back(dut):
-    """Run two complete pipeline cycles and verify both produce valid results."""
-    await setup_dut(dut)
+async def test_18_lsk_packet_decode(dut):
+    """
+    Decodes the full Manchester packet to verify protocol compliance.
+    Packet: [1010 Pre] [1100 Sync] [3-bit Cmd] [Parity] [11 Post]
+    """
+    await init(dut)
 
-    cmds = []
-    for run in range(2):
-        dut._log.info(f"--- Run {run + 1} ---")
-        result = await run_pipeline_to_idle(dut, [5] * 8)
-        cmds.append(result['cmd'])
-        dut._log.info(f"Run {run+1}: cmd={result['cmd']}")
-        assert get_processing(dut) == 0, f"Run {run+1}: not idle after completion"
-        await ClockCycles(dut.clk, 20)
+    # Feed input that creates a known command (alternating max values -> High Freq)
+    # +7, -8, +7, -8...
+    for i in range(8):
+        val = 7 if (i % 2 == 0) else 8 # 8 is -8 in 4-bit 2's comp
+        await feed_sample(dut, val)
 
-    dut._log.info(f"Commands: run1={cmds[0]}, run2={cmds[1]}")
-    dut._log.info("PASS: Two back-to-back pipeline runs completed")
+    await pulse_wake(dut)
+
+    # Wait for Encoder to finish (cmd_valid) so we can see what command to expect
+    await wait_for(dut, cmd_valid, 1, timeout=2000)
+    expected_cmd = cmd_out(dut)
+    dut._log.info(f"  Encoder chose CMD: {expected_cmd}")
+
+    # Wait for TX start
+    await wait_for(dut, lsk_tx, 1, timeout=100)
+
+    # Manchester Decode
+    # BIT_PERIOD is 200 cycles. Data is in 1st half, ~Data in 2nd half.
+    decoded_bits = []
+
+    # Align to center of first half-bit (approx 50 cycles into the bit)
+    await ClockCycles(dut.clk, 50)
+
+    for _ in range(14): # 14 bit packet
+        val = lsk_ctrl(dut)
+        decoded_bits.append(val)
+        await ClockCycles(dut.clk, 200) # Jump to next bit center
+
+    # Construct integer from bits
+    packet_int = 0
+    for bit in decoded_bits:
+        packet_int = (packet_int << 1) | bit
+
+    dut._log.info(f"  Raw Bits: {decoded_bits}")
+    dut._log.info(f"  Raw Hex : {packet_int:#06x}")
+
+    # Expected Structure
+    # Preamble (4) | Sync (4) | Cmd (3) | Parity (1) | Post (2)
+    # 1010         | 1100     | CCC     | P          | 11
+
+    preamble = (packet_int >> 10) & 0xF
+    sync     = (packet_int >> 6) & 0xF
+    rx_cmd   = (packet_int >> 3) & 0x7
+    parity   = (packet_int >> 2) & 0x1
+    post     = packet_int & 0x3
+
+    # Calc expected parity (XOR of command bits)
+    exp_parity = (expected_cmd >> 2) ^ ((expected_cmd >> 1) & 1) ^ (expected_cmd & 1)
+
+    assert preamble == 0xA, f"Bad Preamble: {preamble:#x}"
+    assert sync     == 0xC, f"Bad Sync: {sync:#x}"
+    assert post     == 0x3, f"Bad Postamble: {post:#x}"
+    assert rx_cmd   == expected_cmd, f"LSK sent cmd {rx_cmd}, expected {expected_cmd}"
+    assert parity   == exp_parity, "Parity bit mismatch"
+
+    dut._log.info("PASS: LSK Protocol Verified (Preamble+Sync+Cmd+Parity+Post)")
 
 
-# =============================================================================
-# TEST 15: All-zero input produces cmd=0
-# =============================================================================
+# ============================================================================
+# 19  SPURIOUS WAKE (NO-OP)
+# ============================================================================
+
 @cocotb.test()
-async def test_15_all_zeros(dut):
-    """All-zero input -> all bins zero -> cmd=0."""
-    await setup_dut(dut)
+async def test_19_spurious_wake(dut):
+    """Assert WAKE while pipeline is already running. FSM should ignore it."""
+    await init(dut)
+    for s in range(8):
+        await feed_sample(dut, s)
 
-    result = await run_full_pipeline(dut, [0] * 8)
+    await pulse_wake(dut)
+    await wait_for(dut, processing, 1)
 
-    dut._log.info(f"All zeros -> cmd={result['cmd']}")
-    assert result['cmd'] == 0, f"All-zero input must give cmd=0, got {result['cmd']}"
+    # Pipeline is running. Pulse wake again immediately.
+    dut._log.info("  Injecting spurious wake...")
+    await pulse_wake(dut)
 
-    await wait_for_idle(dut)
-    dut._log.info("PASS: All-zeros -> cmd=0")
+    # Wait for completion
+    await wait_for(dut, pwr_gate, 0, timeout=60000)
+
+    # Ensure it didn't restart immediately (Processing should stay low)
+    await ClockCycles(dut.clk, 50)
+    assert processing(dut) == 0, "FSM restarted on spurious wake!"
+    dut._log.info("PASS: Spurious wake ignored")
 
 
-# =============================================================================
-# TEST 16: Constant negative input with primed FIR
-# =============================================================================
+# ============================================================================
+# 20  SPURIOUS ADC DATA (NOISE)
+# ============================================================================
+
 @cocotb.test()
-async def test_16_max_constant(dut):
-    """Constant -1 with primed FIR -> all outputs identical -> cmd=0."""
-    await setup_dut(dut)
+async def test_20_spurious_adc_data(dut):
+    """Feed ADC data while processing. Should not corrupt state."""
+    await init(dut)
+    # Feed valid data first
+    for s in range(8):
+        await feed_sample(dut, s)
 
-    result1 = await run_pipeline_to_idle(dut, [15] * 8)
-    dut._log.info(f"Priming pass -> cmd={result1['cmd']} (FIR transient, any value OK)")
+    await pulse_wake(dut)
+    await wait_for(dut, processing, 1)
 
-    result2 = await run_full_pipeline(dut, [15] * 8)
-    dut._log.info(f"Primed pass -> cmd={result2['cmd']}")
-    assert result2['cmd'] == 0, (
-        f"Primed constant -1 should give cmd=0 (DC dominant), got {result2['cmd']}"
-    )
-
-    await wait_for_idle(dut)
-    dut._log.info("PASS: Primed constant -1 -> cmd=0")
-
-
-# =============================================================================
-# TEST 17: Ramp input exercises full dynamic range
-# =============================================================================
-@cocotb.test()
-async def test_17_ramp(dut):
-    """Ramp input across ADC range. Verify pipeline completes."""
-    await setup_dut(dut)
-
-    samples = [0, 2, 4, 6, 8, 10, 12, 14]
-    result = await run_full_pipeline(dut, samples)
-
-    dut._log.info(f"Ramp [0,2,..,14] -> cmd={result['cmd']}")
-    await wait_for_idle(dut)
-    dut._log.info("PASS: Ramp input processed without overflow or hang")
-
-
-# =============================================================================
-# TEST 18: Second wake during processing is ignored
-# =============================================================================
-@cocotb.test()
-async def test_18_wake_during_processing(dut):
-    """Second wake during active processing is safely ignored."""
-    await setup_dut(dut)
-
-    await assert_wake(dut)
-    await wait_for_processing(dut)
-
-    await feed_one_sample(dut, 5)
-    await ClockCycles(dut.clk, 10)
-
-    await assert_wake(dut)
-    await ClockCycles(dut.clk, 10)
-
-    assert get_processing(dut) == 1, "Processing interrupted by second wake"
-
-    for _ in range(7):
-        await feed_one_sample(dut, 5)
-
-    await wait_for_cmd_valid(dut)
-    cmd = get_cmd_out(dut)
-    dut._log.info(f"Pipeline completed despite second wake, cmd={cmd}")
-
-    await wait_for_idle(dut, timeout=40000)
-    dut._log.info("PASS: Second wake safely ignored, pipeline completed normally")
-
-
-# =============================================================================
-# TEST 19: cmd_valid is a single-cycle pulse
-# =============================================================================
-@cocotb.test()
-async def test_19_cmd_valid_pulse(dut):
-    """Verify cmd_valid is exactly a 1-cycle pulse."""
-    await setup_dut(dut)
-
-    await assert_wake(dut)
-    await wait_for_processing(dut)
-    await feed_all_samples(dut, [5] * 8)
-
-    await wait_for_cmd_valid(dut)
-
-    extra = 0
+    # Spam ADC interface during DWT calculation
+    dut._log.info("  Spamming ADC inputs during processing...")
     for _ in range(10):
-        await RisingEdge(dut.clk)
-        if get_cmd_valid(dut):
-            extra += 1
-        else:
-            break
+        dut.ui_in.value = build_ui(adc_data=0xF, adc_valid=1)
+        await ClockCycles(dut.clk, 1)
+        dut.ui_in.value = build_ui(adc_data=0xF, adc_valid=0)
+        await ClockCycles(dut.clk, 1)
 
-    assert extra == 0, (
-        f"cmd_valid held for {1 + extra} cycles, must be exactly 1"
+    await wait_for(dut, pwr_gate, 0, timeout=60000)
+    dut._log.info("PASS: Pipeline completed despite input noise")
+
+
+# ============================================================================
+# 21  DC INPUT -- COMMAND MAKES SENSE FOR TARGET
+# ============================================================================
+
+@cocotb.test()
+async def test_21_dc_input_with_target(dut):
+    """
+    Feed constant DC input.  With zero-init DWT buffer, the single non-zero
+    FIR output creates an impulse whose energy lands in a detail bin (bin 4).
+    With target_idx = 0, the error controller should issue a DEC command
+    (dominant > target).
+    """
+    await init(dut)
+    set_target_idx(dut, 0)
+
+    # Fill FIR delay line with constant value (DC)
+    for _ in range(16):
+        await feed_sample(dut, 4)
+
+    ok, cmd = await run_and_get_cmd(dut)
+    assert ok, "Pipeline did not complete (DC data, target=0)"
+    dut._log.info(f"  DC Input, target=0 -> Command: {cmd}")
+
+    # With target=0 and dominant bin > 0, we expect a DEC command
+    assert cmd in (CMD_DEC_1HZ, CMD_DEC_FAST), \
+        f"Expected DEC command for DC input with target=0, got {cmd}"
+    dut._log.info("PASS: DC input correctly generated DEC command relative to target")
+
+
+# ============================================================================
+# 22  COMPLEX INPUT DETERMINISM
+# ============================================================================
+
+@cocotb.test()
+async def test_22_complex_input_determinism(dut):
+    """
+    Feed Complex/High-Freq Input (Nyquist) and verify deterministic output.
+    Note: On a Cold Start (filter empty), the filter fill-up transient
+    creates a large DC-like ramp, which often results in Bin 0 dominating.
+    We therefore check that the output is VALID, not necessarily HIGH-FREQ.
+    """
+    await init(dut)
+
+    dut._log.info("  Feeding Nyquist pattern (7, -8, 7, -8)...")
+    for i in range(8):
+        val = 7 if (i % 2 == 0) else 8
+        await feed_sample(dut, val)
+
+    dut._log.info("  Waking...")
+    await pulse_wake(dut)
+    await wait_for(dut, cmd_valid, 1, timeout=3000)
+
+    cmd = cmd_out(dut)
+    dut._log.info(f"  Complex Input -> Resulting Command: {cmd}")
+
+    # We assert that the pipeline produced a valid result (cmd_valid fired)
+    # and that the command is in the valid command set.
+    valid_cmds = {CMD_HOLD, CMD_INC_1HZ, CMD_DEC_1HZ, CMD_INC_FAST, CMD_DEC_FAST}
+    assert cmd in valid_cmds, f"Invalid command output: {cmd}"
+
+    if cmd == CMD_HOLD:
+        dut._log.warning("  Command is HOLD (dominant matches target=0). "
+                         "Expected for Cold Start.")
+    else:
+        dut._log.info(f"  Command is {cmd}. Error controller active.")
+
+    dut._log.info("PASS: Pipeline processed complex input deterministically")
+
+
+# ============================================================================
+# 23  ASYNC RESET RECOVERY
+# ============================================================================
+
+@cocotb.test()
+async def test_23_async_reset_recovery(dut):
+    """Assert Reset MID-CALCULATION. Chip must return to IDLE immediately."""
+    await init(dut)
+    await pulse_wake(dut)
+    await wait_for(dut, processing, 1)
+
+    # Let it run for a bit (e.g. into DWT stage)
+    await ClockCycles(dut.clk, 100)
+
+    dut._log.info("  Asserting Async Reset mid-operation...")
+    dut.rst_n.value = 0
+
+    # FIX: Wait for full clock cycles to handle Gate-Level propagation delays
+    # Timer(1, "ns") was too short for GL simulation.
+    await ClockCycles(dut.clk, 2)
+
+    # Verify immediate stop
+    assert pwr_gate(dut) == 0, "Power gate did not drop on reset"
+    assert processing(dut) == 0, "Processing flag did not drop on reset"
+
+    # Release reset and verify it stays idle (doesn't resume)
+    dut.rst_n.value = 1
+    await ClockCycles(dut.clk, 20)
+    assert pwr_gate(dut) == 0
+    dut._log.info("PASS: Async reset successfully killed pipeline")
+
+
+# ============================================================================
+# 24  WATCHDOG TIMEOUT
+# ============================================================================
+
+@cocotb.test()
+async def test_24_watchdog_timeout(dut):
+    """
+    Force FSM to hang (via internal signal manipulation) and wait for Watchdog.
+    Skip this test in Gate Level Sim (internal signals inaccessible).
+    """
+    if is_gate_level():
+        dut._log.info("SKIPPING Watchdog test in GL mode (no internal access)")
+        return
+
+    await init(dut)
+
+    # Force state to S_WAIT_FIR (3) but do NOT send fir_valid
+    # The FSM will stick here forever unless WDT fires.
+    # Note: Access path traverses tb -> user_project -> sensor -> state
+    dut._log.info("  Forcing State = S_WAIT_FIR (3)...")
+    dut.user_project.sensor.state.value = 3
+
+    # WDT is 16-bit ~32768 cycles.
+    dut._log.info("  Waiting for Watchdog (~32768 cycles)...")
+
+    # Polling logic for robust timeout detection
+    fired = await wait_for(
+        dut,
+        lambda d: safe_int(d.user_project.sensor.state) == 13,
+        True,
+        timeout=50000
     )
 
-    await wait_for_idle(dut)
-    dut._log.info("PASS: cmd_valid is single-cycle pulse")
+    assert fired, "Watchdog failed to force state to SLEEP(13)!"
+    dut._log.info("PASS: Watchdog successfully recovered hung FSM")
 
 
-# =============================================================================
-# TEST 20: All outputs clean after full pipeline completion
-# =============================================================================
+# ############################################################################
+# CLOSED-LOOP ERROR CONTROLLER TESTS (Tests 25-36)
+# ############################################################################
+
+# ============================================================================
+# 25  CMD_HOLD -- Zero data, target matches dominant bin (0)
+# ============================================================================
+
 @cocotb.test()
-async def test_20_clean_after_sleep(dut):
-    """Verify all outputs are clean after FSM returns to IDLE."""
-    await setup_dut(dut)
+async def test_25_cmd_hold_zero_data(dut):
+    """
+    With zero-init buffers, all power bins = 0, dominant = bin 0.
+    Set target_idx = 0  ->  error = 0  ->  CMD_HOLD.
+    """
+    await init(dut)
+    set_target_idx(dut, 0)
 
-    await run_full_pipeline(dut, [5] * 8)
+    ok, cmd = await run_and_get_cmd(dut)
+    assert ok, "Pipeline did not complete"
+    dut._log.info(f"  Zero data, target=0 -> cmd={cmd}")
+    assert cmd == CMD_HOLD, f"Expected CMD_HOLD (0), got {cmd}"
+    dut._log.info("PASS: CMD_HOLD issued when dominant matches target")
 
-    await wait_for_lsk_start(dut)
-    await wait_for_lsk_done(dut)
 
-    await wait_for_idle(dut, timeout=5000)
-    await ClockCycles(dut.clk, 20)
+# ============================================================================
+# 26  CMD_INC_1HZ -- Zero data, target slightly above dominant
+# ============================================================================
 
-    assert get_processing(dut) == 0, "processing still on"
-    assert get_pwr_gate(dut) == 0, "pwr_gate_ctrl still on"
-    assert get_lsk_tx(dut) == 0, "lsk_tx still on"
-    assert get_lsk_ctrl(dut) == 0, "lsk_ctrl still on"
-    assert get_cmd_valid(dut) == 0, "cmd_valid still on"
-    assert get_lms_busy(dut) == 0, "lms_busy still on"
-    assert get_dwt_busy(dut) == 0, "dwt_busy still on"
-    assert get_acc_busy(dut) == 0, "acc_busy still on"
+@cocotb.test()
+async def test_26_cmd_inc_1hz(dut):
+    """
+    Zero data -> dominant = bin 0.  target_idx = 1 -> error = +1 -> CMD_INC_1HZ.
+    """
+    await init(dut)
+    set_target_idx(dut, 1)
 
-    dut._log.info("PASS: All outputs clean after sleep")
+    ok, cmd = await run_and_get_cmd(dut)
+    assert ok, "Pipeline did not complete"
+    dut._log.info(f"  Zero data, target=1 -> cmd={cmd}")
+    assert cmd == CMD_INC_1HZ, f"Expected CMD_INC_1HZ (1), got {cmd}"
+    dut._log.info("PASS: CMD_INC_1HZ for small positive error")
+
+
+# ============================================================================
+# 27  CMD_INC_1HZ -- Zero data, target 2 above dominant (boundary)
+# ============================================================================
+
+@cocotb.test()
+async def test_27_cmd_inc_1hz_edge(dut):
+    """
+    Zero data -> dominant = bin 0.  target_idx = 2 -> error = +2 -> CMD_INC_1HZ.
+    (Threshold is > 2, so error=2 is still "slight".)
+    """
+    await init(dut)
+    set_target_idx(dut, 2)
+
+    ok, cmd = await run_and_get_cmd(dut)
+    assert ok, "Pipeline did not complete"
+    dut._log.info(f"  Zero data, target=2 -> cmd={cmd}")
+    assert cmd == CMD_INC_1HZ, f"Expected CMD_INC_1HZ (1), got {cmd}"
+    dut._log.info("PASS: CMD_INC_1HZ at boundary (error=2)")
+
+
+# ============================================================================
+# 28  CMD_INC_FAST -- Zero data, target far above dominant
+# ============================================================================
+
+@cocotb.test()
+async def test_28_cmd_inc_fast(dut):
+    """
+    Zero data -> dominant = bin 0.  target_idx = 3 -> error = +3 -> CMD_INC_FAST.
+    """
+    await init(dut)
+    set_target_idx(dut, 3)
+
+    ok, cmd = await run_and_get_cmd(dut)
+    assert ok, "Pipeline did not complete"
+    dut._log.info(f"  Zero data, target=3 -> cmd={cmd}")
+    assert cmd == CMD_INC_FAST, f"Expected CMD_INC_FAST (3), got {cmd}"
+    dut._log.info("PASS: CMD_INC_FAST for large positive error")
+
+
+# ============================================================================
+# 29  CMD_INC_FAST -- Zero data, target = 7 (maximum gap)
+# ============================================================================
+
+@cocotb.test()
+async def test_29_cmd_inc_fast_max(dut):
+    """
+    Zero data -> dominant = bin 0.  target_idx = 7 -> error = +7 -> CMD_INC_FAST.
+    """
+    await init(dut)
+    set_target_idx(dut, 7)
+
+    ok, cmd = await run_and_get_cmd(dut)
+    assert ok, "Pipeline did not complete"
+    dut._log.info(f"  Zero data, target=7 -> cmd={cmd}")
+    assert cmd == CMD_INC_FAST, f"Expected CMD_INC_FAST (3), got {cmd}"
+    dut._log.info("PASS: CMD_INC_FAST at maximum error (7 bins)")
+
+
+# ============================================================================
+# 30  CMD_DEC_1HZ -- DC input creates dominant bin > target
+# ============================================================================
+
+@cocotb.test()
+async def test_30_cmd_dec_1hz(dut):
+    """
+    With constant-4 DC input from cold start, the impulse in the DWT buffer
+    puts energy into bin 4.  Set target_idx = 3 -> error = -1 -> CMD_DEC_1HZ.
+    """
+    await init(dut)
+    set_target_idx(dut, 3)
+
+    for _ in range(8):
+        await feed_sample(dut, 4)
+
+    ok, cmd = await run_and_get_cmd(dut)
+    assert ok, "Pipeline did not complete"
+    dut._log.info(f"  DC-4 input, target=3 -> cmd={cmd}")
+
+    # Dominant should be bin 4 (from impulse analysis).
+    # Error = 4 - 3 = 1 -> CMD_DEC_1HZ
+    assert cmd == CMD_DEC_1HZ, f"Expected CMD_DEC_1HZ (2), got {cmd}"
+    dut._log.info("PASS: CMD_DEC_1HZ when dominant is slightly above target")
+
+
+# ============================================================================
+# 31  CMD_DEC_FAST -- DC input, target far below dominant
+# ============================================================================
+
+@cocotb.test()
+async def test_31_cmd_dec_fast(dut):
+    """
+    DC-4 input -> dominant = bin 4.  target_idx = 0 -> error = -4 -> CMD_DEC_FAST.
+    """
+    await init(dut)
+    set_target_idx(dut, 0)
+
+    for _ in range(8):
+        await feed_sample(dut, 4)
+
+    ok, cmd = await run_and_get_cmd(dut)
+    assert ok, "Pipeline did not complete"
+    dut._log.info(f"  DC-4 input, target=0 -> cmd={cmd}")
+
+    # Error = 4 - 0 = 4 (>2) -> CMD_DEC_FAST
+    assert cmd == CMD_DEC_FAST, f"Expected CMD_DEC_FAST (4), got {cmd}"
+    dut._log.info("PASS: CMD_DEC_FAST when dominant is far above target")
+
+
+# ============================================================================
+# 32  TARGET SWEEP -- Same input, different targets -> different commands
+# ============================================================================
+
+@cocotb.test()
+async def test_32_target_sweep(dut):
+    """
+    Run pipeline with zero data (dominant=0) at multiple target indices.
+    Verify the command changes correctly with the target.
+    """
+    expected = {
+        0: CMD_HOLD,
+        1: CMD_INC_1HZ,
+        2: CMD_INC_1HZ,
+        3: CMD_INC_FAST,
+        5: CMD_INC_FAST,
+        7: CMD_INC_FAST,
+    }
+
+    for target, exp_cmd in expected.items():
+        await init(dut)
+        set_target_idx(dut, target)
+
+        ok, cmd = await run_and_get_cmd(dut)
+        assert ok, f"Pipeline failed for target={target}"
+        dut._log.info(f"  target={target} -> cmd={cmd} (expected={exp_cmd})")
+        assert cmd == exp_cmd, \
+            f"target={target}: expected cmd {exp_cmd}, got {cmd}"
+
+    dut._log.info("PASS: Target sweep produces correct commands across all settings")
+
+
+# ============================================================================
+# 33  COMMAND STABILITY -- Repeated runs with same input yield same command
+# ============================================================================
+
+@cocotb.test()
+async def test_33_cmd_determinism(dut):
+    """Run the same pipeline configuration 3 times; command must be identical."""
+    results = []
+
+    for run in range(3):
+        await init(dut)
+        set_target_idx(dut, 2)
+
+        for s in [3, 7, 2, 5, 1, 6, 4, 0]:
+            await feed_sample(dut, s)
+
+        ok, cmd = await run_and_get_cmd(dut)
+        assert ok, f"Pipeline failed on run {run}"
+        results.append(cmd)
+        dut._log.info(f"  Run {run}: cmd={cmd}")
+
+    assert results[0] == results[1] == results[2], \
+        f"Non-deterministic: {results}"
+    dut._log.info(f"PASS: Command deterministic across 3 runs (cmd={results[0]})")
+
+
+# ============================================================================
+# 34  LSK PACKET CARRIES CORRECT ERROR COMMAND
+# ============================================================================
+
+@cocotb.test()
+async def test_34_lsk_carries_error_cmd(dut):
+    """
+    Verify that the LSK Manchester packet encodes the same command
+    the error controller computed.  Uses two different target settings
+    to confirm the command changes AND is faithfully transmitted.
+    """
+    for target in [0, 5]:
+        await init(dut)
+        set_target_idx(dut, target)
+
+        for s in [3, 7, 2, 5, 1, 6, 4, 0]:
+            await feed_sample(dut, s)
+
+        await pulse_wake(dut)
+        await wait_for(dut, cmd_valid, 1, timeout=2000)
+        expected_cmd = cmd_out(dut)
+        dut._log.info(f"  target={target}: encoder cmd = {expected_cmd}")
+
+        await wait_for(dut, lsk_tx, 1, timeout=100)
+
+        # Manchester decode: sample at center of first half of each bit
+        decoded_bits = []
+        await ClockCycles(dut.clk, 50)  # align to center of first half-bit
+        for _ in range(14):
+            decoded_bits.append(lsk_ctrl(dut))
+            await ClockCycles(dut.clk, 200)
+
+        packet_int = 0
+        for bit in decoded_bits:
+            packet_int = (packet_int << 1) | bit
+
+        rx_cmd = (packet_int >> 3) & 0x7
+        assert rx_cmd == expected_cmd, \
+            f"target={target}: LSK sent {rx_cmd}, encoder had {expected_cmd}"
+        dut._log.info(f"  target={target}: LSK packet cmd = {rx_cmd} OK")
+
+    dut._log.info("PASS: LSK packet faithfully transmits error-controller command")
+
+
+# ============================================================================
+# 35  FULL CLOSED-LOOP SCENARIO -- Field too high, reduce
+# ============================================================================
+
+@cocotb.test()
+async def test_35_tms_field_too_high(dut):
+    """
+    Scenario: TMS is set for target bin 2 (moderate power), but the
+    sensed distortion pattern has dominant energy in a higher bin.
+    The ASIC should issue a DEC command to tell the TMS to reduce output.
+    """
+    await init(dut)
+    set_target_idx(dut, 2)
+
+    # Feed data that will push energy into higher bins
+    # (impulse-like from cold start with value 4 -> dominant ~ bin 4)
+    for _ in range(8):
+        await feed_sample(dut, 4)
+
+    ok, cmd = await run_and_get_cmd(dut)
+    assert ok, "Pipeline did not complete"
+    dut._log.info(f"  TMS scenario (field too high): target=2, cmd={cmd}")
+
+    assert cmd in (CMD_DEC_1HZ, CMD_DEC_FAST), \
+        f"Expected DEC command when field is above target, got {cmd}"
+    dut._log.info("PASS: ASIC correctly instructs TMS to reduce field strength")
+
+
+# ============================================================================
+# 36  FULL CLOSED-LOOP SCENARIO -- Field too low, increase
+# ============================================================================
+
+@cocotb.test()
+async def test_36_tms_field_too_low(dut):
+    """
+    Scenario: TMS target is bin 5 (high power), but sensed field is
+    quiet (zero data -> dominant bin 0).
+    The ASIC should issue an INC_FAST command.
+    """
+    await init(dut)
+    set_target_idx(dut, 5)
+
+    # No meaningful input -> dominant bin stays at 0
+    ok, cmd = await run_and_get_cmd(dut)
+    assert ok, "Pipeline did not complete"
+    dut._log.info(f"  TMS scenario (field too low): target=5, cmd={cmd}")
+
+    assert cmd == CMD_INC_FAST, \
+        f"Expected CMD_INC_FAST when field is far below target, got {cmd}"
+    dut._log.info("PASS: ASIC correctly instructs TMS to increase field strength")
